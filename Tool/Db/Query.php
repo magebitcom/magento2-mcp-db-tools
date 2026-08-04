@@ -43,10 +43,13 @@ use Throwable;
  *    guard bounds the *shape* of a query and the number of rows returned, not the work done, so an
  *    unbounded cross join or a wide hashing scan is limited only by this — which is why a server
  *    that accepts neither timeout variable gets the query refused rather than run unbounded;
- * 5. **streamed** execution: rows are pulled one at a time and the read stops at the byte budget,
- *    so a result set far larger than {@see self::MAX_PAYLOAD_BYTES} cannot be materialised in PHP.
- *    The guard's row cap bounds the number of rows, never their width, so this is the only bound on
- *    the size of what a single query can pull into the process.
+ * 5. **streamed** execution: result buffering is switched off for the duration of the read (Magento
+ *    turns it on at connect time, which makes the driver materialise the whole set inside PHP before
+ *    the first row can be inspected), rows are pulled one at a time, and the read stops at the byte
+ *    budget. The guard's row cap bounds the number of rows, never their width, so this is the only
+ *    bound on how much a single query can pull into the process. Buffering is restored, and the
+ *    cursor closed, on every exit path — an unbuffered cursor left open would break the next query
+ *    on the shared connection, the audit-log insert included.
  *
  * **Audit note:** the executed SQL is written to `magebit_mcp_audit_log` verbatim (capped at
  * {@see self::AUDIT_SQL_LENGTH} characters) and is *not* PII-redacted, because it is SQL rather
@@ -72,6 +75,28 @@ class Query implements ToolInterface, UnderlyingAclAwareInterface
     private const PAYLOAD_OVERHEAD_BYTES = 1024;
 
     private const AUDIT_SQL_LENGTH = 1000;
+
+    /**
+     * Cap on how much of a driver message is echoed back to the caller.
+     */
+    private const DRIVER_MESSAGE_LENGTH = 500;
+
+    /**
+     * Failure classes whose message may be shown to the caller: they describe *this statement*
+     * (unknown column, missing table, lock wait, deadlock) and carry nothing about the
+     * infrastructure. An allowlist rather than a deny-list, so an unfamiliar failure class is
+     * summarised instead of echoed — connection-level messages name the DB account and the
+     * application host (`Access denied for user 'magento'@'10.1.0.10'`).
+     *
+     * @var list<class-string<Throwable>>
+     */
+    private const ECHOABLE_FAILURES = [
+        \Zend_Db_Statement_Exception::class,
+        \Magento\Framework\DB\Adapter\TableNotFoundException::class,
+        \Magento\Framework\DB\Adapter\LockWaitException::class,
+        \Magento\Framework\DB\Adapter\DeadlockException::class,
+        \Magento\Framework\DB\Adapter\DuplicateException::class,
+    ];
 
     private const MIN_QUERY_LENGTH = 6;
     private const MAX_QUERY_LENGTH = 8000;
@@ -456,16 +481,37 @@ class Query implements ToolInterface, UnderlyingAclAwareInterface
     }
 
     /**
-     * Runs the statement and pulls rows one at a time, stopping at the byte budget. Streaming is
-     * the point: `fetchAll()` would materialise the whole result set in PHP before any cap could
-     * apply, so a 1 GB read of wide `TEXT` columns would be a fatal error rather than a refusal.
+     * Reads the result set with buffering switched off for the duration, restoring it afterwards
+     * whatever happens. Without this the whole set is materialised inside PHP by the driver at
+     * `query()` time — Magento sets `MYSQL_ATTR_USE_BUFFERED_QUERY` on connect — and no cap applied
+     * afterwards can bound memory.
+     *
+     * @param AdapterInterface $connection
+     * @param string $executable
+     * @return array{columns: list<string>, rows: list<array<string, mixed>>, truncated: bool}
+     * @throws LocalizedException On any driver failure, or when the first row alone exceeds the cap.
+     */
+    private function streamRows(AdapterInterface $connection, string $executable): array
+    {
+        $buffering = $this->suspendResultBuffering($connection);
+
+        try {
+            return $this->readRows($connection, $executable);
+        } finally {
+            $this->restoreResultBuffering($buffering);
+        }
+    }
+
+    /**
+     * Pulls rows one at a time and stops at the byte budget, so rows beyond the cap are never
+     * converted into PHP values.
      *
      * @param AdapterInterface $connection
      * @param string $executable Executed verbatim; also echoed back, so it counts against the budget.
      * @return array{columns: list<string>, rows: list<array<string, mixed>>, truncated: bool}
      * @throws LocalizedException On any driver failure, or when the first row alone exceeds the cap.
      */
-    private function streamRows(AdapterInterface $connection, string $executable): array
+    private function readRows(AdapterInterface $connection, string $executable): array
     {
         $budget = self::MAX_PAYLOAD_BYTES - self::PAYLOAD_OVERHEAD_BYTES - strlen($executable);
         $statement = $this->runStatement($connection, $executable);
@@ -478,6 +524,10 @@ class Query implements ToolInterface, UnderlyingAclAwareInterface
             while (($row = $this->fetchRow($statement)) !== null) {
                 // +1 for the comma that will separate this row from the previous one.
                 $size = strlen($this->encode($row)) + 1;
+                if ($columns === []) {
+                    // The `columns` list is part of the payload too, so it comes out of the budget.
+                    $size += strlen($this->encode(array_keys($row)));
+                }
 
                 if ($used + $size > $budget) {
                     if ($rows === []) {
@@ -501,14 +551,109 @@ class Query implements ToolInterface, UnderlyingAclAwareInterface
                 $used += $size;
             }
         } finally {
-            try {
-                $statement->closeCursor();
-            } catch (Throwable) {
-                // A cursor we could not close is the driver's problem, not the operator's.
-            }
+            $this->closeCursor($connection, $statement);
         }
 
         return ['columns' => $columns, 'rows' => $rows, 'truncated' => $truncated];
+    }
+
+    /**
+     * @param AdapterInterface $connection
+     * @return array{pdo: \PDO, buffered: bool}|null Null when buffering could not be switched off.
+     */
+    private function suspendResultBuffering(AdapterInterface $connection): ?array
+    {
+        $pdo = $this->pdoHandle($connection);
+        if ($pdo === null) {
+            return null;
+        }
+
+        try {
+            $previous = $pdo->getAttribute(\PDO::MYSQL_ATTR_USE_BUFFERED_QUERY);
+            $pdo->setAttribute(\PDO::MYSQL_ATTR_USE_BUFFERED_QUERY, false);
+
+            return ['pdo' => $pdo, 'buffered' => !is_bool($previous) || $previous];
+        } catch (Throwable $exception) {
+            $this->logger->warning(
+                'db.query could not switch off result buffering; the result set will be held in PHP '
+                . 'in full, so a wide result set can exhaust memory before the response cap applies.',
+                ['exception' => $exception->getMessage()]
+            );
+
+            return null;
+        }
+    }
+
+    /**
+     * @param array{pdo: \PDO, buffered: bool}|null $buffering
+     * @return void
+     */
+    private function restoreResultBuffering(?array $buffering): void
+    {
+        if ($buffering === null) {
+            return;
+        }
+
+        try {
+            $buffering['pdo']->setAttribute(\PDO::MYSQL_ATTR_USE_BUFFERED_QUERY, $buffering['buffered']);
+        } catch (Throwable $exception) {
+            // Leaving the shared connection unbuffered would break the next query on it, so this is
+            // one of the few places worth an error-level line.
+            $this->logger->error(
+                'db.query could not restore result buffering on the shared connection.',
+                ['exception' => $exception->getMessage()]
+            );
+        }
+    }
+
+    /**
+     * The adapter's own PDO handle, or null when this is not a PDO adapter (or cannot connect).
+     *
+     * @param AdapterInterface $connection
+     * @return \PDO|null
+     */
+    private function pdoHandle(AdapterInterface $connection): ?\PDO
+    {
+        if (!$connection instanceof \Zend_Db_Adapter_Abstract) {
+            return null;
+        }
+
+        try {
+            $handle = $connection->getConnection();
+        } catch (Throwable) {
+            return null;
+        }
+
+        return $handle instanceof \PDO ? $handle : null;
+    }
+
+    /**
+     * An unbuffered cursor left open would fail every later query on this connection — the audit
+     * log insert included — so a cursor that will not close costs us the connection instead.
+     *
+     * @param AdapterInterface $connection
+     * @param \Zend_Db_Statement_Interface $statement
+     * @return void
+     */
+    private function closeCursor(AdapterInterface $connection, \Zend_Db_Statement_Interface $statement): void
+    {
+        try {
+            $statement->closeCursor();
+        } catch (Throwable $exception) {
+            $this->logger->warning(
+                'db.query could not close its cursor; dropping the connection so nothing inherits it.',
+                ['exception' => $exception->getMessage()]
+            );
+
+            try {
+                // `closeConnection()` is on the Zend adapter rather than Magento's interface.
+                if ($connection instanceof \Zend_Db_Adapter_Abstract) {
+                    $connection->closeConnection();
+                }
+            } catch (Throwable) {
+                // Nothing further to do: the next caller gets a fresh connection either way.
+            }
+        }
     }
 
     /**
@@ -552,25 +697,63 @@ class Query implements ToolInterface, UnderlyingAclAwareInterface
     }
 
     /**
-     * The driver's own message is echoed back on purpose: `Unknown column 'x'` is the one error an
-     * agent can self-correct from and a timeout kill is the one an operator needs to see. The
-     * operator wrote the SQL and the guard already bounded which tables it could reach.
+     * A statement-level message is echoed back on purpose: `Unknown column 'x'` is the one error an
+     * agent can self-correct from and a timeout kill is the one an operator needs to see. Anything
+     * else is summarised and logged instead — see {@see self::ECHOABLE_FAILURES}.
      *
      * @param Throwable $exception
      * @return LocalizedException
      */
     private function driverFailure(Throwable $exception): LocalizedException
     {
+        $cause = $exception instanceof \Exception ? $exception : null;
+
+        if (!$this->mayEchoFailure($exception)) {
+            $this->logger->error(
+                'db.query hit a database failure whose message is not safe to return.',
+                ['class' => get_class($exception), 'exception' => $exception->getMessage()]
+            );
+
+            return new LocalizedException(
+                __(
+                    'The query could not be run because of a database connection problem. The details '
+                    . 'are in the MCP log (var/log/magebit_mcp.log); they are withheld here because '
+                    . 'they describe the server rather than the query.'
+                ),
+                $cause
+            );
+        }
+
+        $message = $exception->getMessage();
+        if (strlen($message) > self::DRIVER_MESSAGE_LENGTH) {
+            $message = substr($message, 0, self::DRIVER_MESSAGE_LENGTH) . '…';
+        }
+
         return new LocalizedException(
             __(
                 'The database could not complete the query: %1. If the server interrupted it on the '
                 . '%2-second statement time limit, narrow the query — fewer rows, fewer joins, or a '
                 . 'tighter WHERE.',
-                $exception->getMessage(),
+                $message,
                 max(1, $this->config->getStatementTimeoutSeconds())
             ),
-            $exception instanceof \Exception ? $exception : null
+            $cause
         );
+    }
+
+    /**
+     * @param Throwable $exception
+     * @return bool
+     */
+    private function mayEchoFailure(Throwable $exception): bool
+    {
+        foreach (self::ECHOABLE_FAILURES as $class) {
+            if ($exception instanceof $class) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /**

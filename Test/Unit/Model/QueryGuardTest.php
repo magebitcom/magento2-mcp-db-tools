@@ -81,7 +81,8 @@ class QueryGuardTest extends TestCase
             $config,
             $matcher,
             self::diArgument('protectedTables'),
-            self::diArgument('protectedIdentifiers')
+            self::diArgument('protectedIdentifiers'),
+            self::diArgument('protectedPrefixedIdentifiers')
         );
 
         return new QueryGuard($config, $policy, new ColumnDenyList($matcher));
@@ -654,8 +655,8 @@ class QueryGuardTest extends TestCase
         return [
             'admin_user' => ['SELECT c.email FROM admin_user c', 'admin_user'],
             'admin_passwords' => ['SELECT password_expires FROM admin_passwords', 'admin_passwords'],
-            // `session_id` would be refused first now that bare `session` is protected, and the
-            // message would name `session` rather than the table under test.
+            // `SELECT session_id …` would now be refused by the column layer (`session_id`) before
+            // reaching the table verdict this case is about, so the column stays neutral.
             'admin_user_session' => ['SELECT user_id FROM admin_user_session', 'admin_user_session'],
             'admin_user_expiration' => ['SELECT expires_at FROM admin_user_expiration', 'admin_user_expiration'],
             'oauth_token' => ['SELECT entity_id FROM oauth_token', 'oauth_token'],
@@ -710,14 +711,88 @@ class QueryGuardTest extends TestCase
     }
 
     /**
+     * `session` / `cache` / `cache_tag` are protected by exact-or-prefixed matching, not word runs:
+     * the table must stay unreadable in every spelling, while ordinary columns that merely contain
+     * the word must stay readable. Both halves are pinned, because either one drifting is a bug.
+     *
+     * @dataProvider prefixedExactProtectedProvider
+     * @param string $sql
+     * @param string $expectedFragment
+     * @param string $prefix
      * @return void
      */
-    public function testSessionAndCacheProtectionReachesTheirColumnsToo(): void
+    public function testPrefixExactProtectedTableIsRefusedInEverySpelling(
+        string $sql,
+        string $expectedFragment,
+        string $prefix = ''
+    ): void {
+        $this->expectException(LocalizedException::class);
+        $this->expectExceptionMessageMatches('/' . preg_quote($expectedFragment, '/') . '/');
+
+        $this->guard(allowedTables: ['customer_entity'], tablePrefix: $prefix)->assertReadOnly($sql);
+    }
+
+    /**
+     * @return array<string, array{string, string, 2?: string}>
+     */
+    public static function prefixedExactProtectedProvider(): array
     {
-        // Consequence of the wide matcher, recorded so it is a decision rather than a surprise:
-        // any identifier carrying `session` or `cache` as a word run is refused, on any table.
-        $this->assertRejected('SELECT session_id FROM customer_entity', 'session');
-        $this->assertRejected('SELECT cache_id FROM customer_entity', 'cache');
+        return [
+            'bare' => ['SELECT data FROM cache', 'cache'],
+            'uppercase' => ['SELECT DATA FROM SESSION', 'session'],
+            'backticked' => ['SELECT data FROM `session`', 'session'],
+            'schema qualified' => ['SELECT data FROM magento.session', 'session'],
+            'prefixed install, prefixed spelling' => ['SELECT data FROM m2_session', 'session', 'm2_'],
+            'prefixed install, bare spelling' => ['SELECT data FROM session', 'session', 'm2_'],
+            'prefixed cache' => ['SELECT data FROM m2_cache', 'cache', 'm2_'],
+            'cache_tag needs its own entry' => ['SELECT tag FROM cache_tag', 'cache_tag'],
+            'joined' => [
+                'SELECT c.entity_id FROM customer_entity c JOIN session s ON s.id = c.entity_id',
+                'session',
+            ],
+        ];
+    }
+
+    /**
+     * @dataProvider releasedFalsePositiveProvider
+     * @param string $sql
+     * @return void
+     */
+    public function testColumnsMerelyContainingAProtectedWordAreReadable(string $sql): void
+    {
+        $this->assertSame($sql . ' LIMIT 100', $this->guard()->assertReadOnly($sql));
+    }
+
+    /**
+     * Live false positives from the previous (word-run) spelling of these two terms. An alias was
+     * enough to trip it, and the message named a table the query never mentioned.
+     *
+     * @return array<string, array{string}>
+     */
+    public static function releasedFalsePositiveProvider(): array
+    {
+        return [
+            'session_cutoff on the likeliest allowlist entry' => [
+                'SELECT entity_id, session_cutoff FROM customer_entity',
+            ],
+            'cache column' => ['SELECT entity_id, cache_lifetime FROM customer_entity'],
+            'cache_id column' => ['SELECT cache_id FROM customer_entity'],
+            'alias' => ['SELECT created_at AS session_start FROM sales_order'],
+        ];
+    }
+
+    /**
+     * Compensation for narrowing the table term: session identifiers and payloads are refused as
+     * *columns*, which is the layer that can tell a column from a table.
+     *
+     * @return void
+     */
+    public function testSessionIdentifierColumnsAreDeniedOnAnyTable(): void
+    {
+        $this->assertRejected('SELECT visitor_id, session_id FROM customer_entity', 'session_id');
+        $this->assertRejected('SELECT session_data FROM customer_entity', 'session_data');
+        // The wide column matcher catches compounds, which is the point of using it here.
+        $this->assertRejected('SELECT admin_session_id FROM customer_entity', 'session_id');
     }
 
     /**
@@ -1046,7 +1121,11 @@ class QueryGuardTest extends TestCase
 
     public function testDiXmlStillProtectsEverySeededName(): void
     {
-        $protected = array_merge(self::diArgument('protectedTables'), self::diArgument('protectedIdentifiers'));
+        $protected = array_merge(
+            self::diArgument('protectedTables'),
+            self::diArgument('protectedIdentifiers'),
+            self::diArgument('protectedPrefixedIdentifiers')
+        );
 
         foreach (
             [
@@ -1058,7 +1137,7 @@ class QueryGuardTest extends TestCase
                 // Added in Task 7's review round: module-owned or Magento-owned tables holding
                 // security material the MCP surface itself produces or depends on.
                 'magebit_mcp_oauth_authorize_handoff', 'magebit_mcp_audit_log', 'session', 'cache',
-                'admin_adobe_ims_webapi',
+                'cache_tag', 'admin_adobe_ims_webapi',
             ] as $name
         ) {
             $this->assertContains($name, $protected, sprintf('`%s` is no longer protected by di.xml.', $name));

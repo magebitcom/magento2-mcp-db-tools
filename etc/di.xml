@@ -48,13 +48,6 @@
                      allowlisting it would let one operator read another operator's queries. -->
                 <item name="magebit_mcp_audit_log" xsi:type="string">magebit_mcp_audit_log</item>
                 <item name="persistent_session" xsi:type="string">persistent_session</item>
-                <!-- `session/save = db`: session_id + session_data for admin and customer sessions
-                     alike, i.e. everything needed to hijack one. Innocuous-looking enough that an
-                     operator trimming a starter allowlist might keep it. -->
-                <item name="session" xsi:type="string">session</item>
-                <!-- DB cache backend: `SELECT data FROM cache` returns the config cache (decrypted
-                     values included) and rendered block HTML. -->
-                <item name="cache" xsi:type="string">cache</item>
                 <!-- Credential-bearing; belongs with oauth_token on principle, even though the
                      column deny-list already catches its token columns. -->
                 <item name="admin_adobe_ims_webapi" xsi:type="string">admin_adobe_ims_webapi</item>
@@ -62,6 +55,24 @@
                 <!-- Encrypted payment-gateway credentials and API keys; system.config.get is the
                      path that redacts them. -->
                 <item name="core_config_data" xsi:type="string">core_config_data</item>
+            </argument>
+            <argument name="protectedPrefixedIdentifiers" xsi:type="array">
+                <!-- Magento tables whose names are single ordinary words. Matched exactly or behind
+                     this install's table prefix (`m2_session`) and nothing wider: word-run matching
+                     here would refuse `customer_entity.session_cutoff`,
+                     `customer_visitor.session_id` and even a `… AS session_start` alias, and would
+                     name a table the query never mentioned. The column side is covered by
+                     ColumnDenyList (`session_id`, `session_data`), which is the layer that can tell
+                     a column from a table. -->
+                <!-- `session/save = db`: session_id + session_data for admin and customer sessions
+                     alike, i.e. everything needed to hijack one. Innocuous-looking enough that an
+                     operator trimming a starter allowlist might keep it. -->
+                <item name="session" xsi:type="string">session</item>
+                <!-- DB cache backend: `SELECT data FROM cache` returns the config cache (decrypted
+                     values included) and rendered block HTML. `cache_tag` needs its own entry now
+                     that `cache` no longer matches word runs. -->
+                <item name="cache" xsi:type="string">cache</item>
+                <item name="cache_tag" xsi:type="string">cache_tag</item>
             </argument>
             <argument name="protectedIdentifiers" xsi:type="array">
                 <!-- Server-owned schemas. `mysql.user` holds password hashes; the rest expose

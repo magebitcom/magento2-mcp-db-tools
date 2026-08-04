@@ -36,6 +36,11 @@ class ColumnDenyList
         'secret',
         'api_key',
         'authentication_string',
+        // Session identifiers and payloads — hijacking material, and the reason the `session` table
+        // itself can be protected by exact name instead of by the wide matcher: this layer catches
+        // `customer_visitor.session_id` and `visitor_session_id` without touching `session_cutoff`.
+        'session_id',
+        'session_data',
         // Payment-card material on sales_order_payment / quote_payment.
         'cc_number_enc',
         'cc_cid_enc',

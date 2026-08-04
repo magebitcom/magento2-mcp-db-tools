@@ -337,6 +337,28 @@ class QueryTest extends TestCase
         self::assertLessThan(40, $this->fetchedRows);
     }
 
+    public function testPayloadStaysUnderTheCapWithManyLongColumnNames(): void
+    {
+        // The `columns` list is part of the payload too. With 90 long names it is several KB, which
+        // is what pushed the response over the cap before the budget accounted for it.
+        $this->guard->method('assertReadOnly')->willReturn('SELECT … FROM sales_order LIMIT 40');
+        $this->guard->method('findRowLimit')->willReturn(40);
+
+        $row = [];
+        for ($column = 0; $column < 90; $column++) {
+            $name = 'a_deliberately_long_column_alias_number_' . str_pad((string) $column, 3, '0', STR_PAD_LEFT);
+            $row[$name] = str_repeat('v', 500);
+        }
+        $this->recordStatements(array_fill(0, 40, $row));
+
+        $response = $this->runTool(['query' => 'SELECT … FROM sales_order LIMIT 40']);
+
+        self::assertTrue($response['truncated']);
+        self::assertIsArray($response['columns']);
+        self::assertCount(90, $response['columns']);
+        self::assertLessThanOrEqual(Query::MAX_PAYLOAD_BYTES, strlen((string) json_encode($response)));
+    }
+
     public function testSingleRowLargerThanThePayloadCapIsRejected(): void
     {
         $this->guard->method('assertReadOnly')->willReturn('SELECT blob FROM sales_order LIMIT 1');
@@ -461,14 +483,16 @@ class QueryTest extends TestCase
         self::assertSame('SELECT entity_id FROM sales_order LIMIT 100', $this->statements[count($this->statements) - 1]);
     }
 
-    public function testDriverErrorOnExecutionSurfacesTheServerMessage(): void
+    public function testStatementErrorOnExecutionSurfacesTheServerMessage(): void
     {
         $this->guard->method('assertReadOnly')->willReturn('SELECT bogus FROM sales_order LIMIT 100');
         $this->connection->method('query')->willReturnCallback(
             function (string $sql): \Zend_Db_Statement_Interface {
                 $this->statements[] = $sql;
                 if (str_starts_with($sql, 'SELECT')) {
-                    throw new \RuntimeException("SQLSTATE[42S22]: Unknown column 'bogus' in 'field list'");
+                    throw new \Zend_Db_Statement_Exception(
+                        "SQLSTATE[42S22]: Column not found: 1054 Unknown column 'bogus_column' in 'field list'"
+                    );
                 }
                 return $this->statementYielding([]);
             }
@@ -478,17 +502,19 @@ class QueryTest extends TestCase
             $this->tool()->execute(['query' => 'SELECT bogus FROM sales_order']);
             self::fail('A driver error was swallowed.');
         } catch (LocalizedException $exception) {
-            self::assertStringContainsString("Unknown column 'bogus'", $exception->getMessage());
+            self::assertStringContainsString("Unknown column 'bogus_column'", $exception->getMessage());
             self::assertStringContainsString('10-second', $exception->getMessage());
         }
     }
 
-    public function testDriverErrorWhileStreamingSurfacesTheServerMessage(): void
+    public function testStatementErrorWhileStreamingSurfacesTheServerMessage(): void
     {
         $this->guard->method('assertReadOnly')->willReturn('SELECT entity_id FROM sales_order LIMIT 100');
         $statement = $this->createMock(\Zend_Db_Statement_Interface::class);
         $statement->method('fetch')->willThrowException(
-            new \RuntimeException('SQLSTATE[70100]: Query execution was interrupted, max_statement_time exceeded')
+            new \Zend_Db_Statement_Exception(
+                'SQLSTATE[70100]: Query execution was interrupted, max_statement_time exceeded'
+            )
         );
         $this->connection->method('query')->willReturn($statement);
 
@@ -496,6 +522,162 @@ class QueryTest extends TestCase
         $this->expectExceptionMessageMatches('/max_statement_time exceeded/');
 
         $this->tool()->execute(['query' => 'SELECT entity_id FROM sales_order']);
+    }
+
+    public function testConnectionLevelFailureIsNotEchoedToTheCaller(): void
+    {
+        $this->guard->method('assertReadOnly')->willReturn('SELECT entity_id FROM sales_order LIMIT 100');
+        $secret = "SQLSTATE[HY000] [1045] Access denied for user 'magento'@'10.1.0.10' (using password: YES)";
+        $this->connection->method('query')->willReturnCallback(
+            function (string $sql) use ($secret): \Zend_Db_Statement_Interface {
+                $this->statements[] = $sql;
+                if (str_starts_with($sql, 'SELECT')) {
+                    throw new \Zend_Db_Adapter_Exception($secret);
+                }
+                return $this->statementYielding([]);
+            }
+        );
+        $this->logger->expects(self::once())->method('error');
+
+        try {
+            $this->tool()->execute(['query' => 'SELECT entity_id FROM sales_order']);
+            self::fail('A connection-level failure did not raise.');
+        } catch (LocalizedException $exception) {
+            self::assertStringNotContainsString('Access denied', $exception->getMessage());
+            self::assertStringNotContainsString('magento', $exception->getMessage());
+            self::assertStringNotContainsString('10.1.0.10', $exception->getMessage());
+            self::assertStringContainsString('connection problem', $exception->getMessage());
+        }
+    }
+
+    public function testEchoedDriverMessageIsTruncated(): void
+    {
+        $this->guard->method('assertReadOnly')->willReturn('SELECT entity_id FROM sales_order LIMIT 100');
+        $this->connection->method('query')->willReturnCallback(
+            function (string $sql): \Zend_Db_Statement_Interface {
+                if (str_starts_with($sql, 'SELECT')) {
+                    throw new \Zend_Db_Statement_Exception(str_repeat('x', 4000));
+                }
+                return $this->statementYielding([]);
+            }
+        );
+
+        try {
+            $this->tool()->execute(['query' => 'SELECT entity_id FROM sales_order']);
+            self::fail('A driver error was swallowed.');
+        } catch (LocalizedException $exception) {
+            self::assertLessThan(1200, strlen($exception->getMessage()));
+            self::assertStringContainsString('…', $exception->getMessage());
+        }
+    }
+
+    public function testResultBufferingIsSuspendedForTheReadAndRestoredAfterwards(): void
+    {
+        $calls = [];
+        $pdo = $this->createMock(\PDO::class);
+        $pdo->method('getAttribute')->willReturn(true);
+        $pdo->method('setAttribute')->willReturnCallback(
+            static function (int $attribute, $value) use (&$calls): bool {
+                if ($attribute === \PDO::MYSQL_ATTR_USE_BUFFERED_QUERY) {
+                    $calls[] = $value;
+                }
+                return true;
+            }
+        );
+
+        $adapter = $this->getMockBuilder(\Magento\Framework\DB\Adapter\Pdo\Mysql::class)
+            ->disableOriginalConstructor()
+            ->onlyMethods(['query', 'fetchOne', 'getConnection', 'closeConnection'])
+            ->getMock();
+        $adapter->method('fetchOne')->willReturn('10.6.16-MariaDB');
+        $adapter->method('getConnection')->willReturn($pdo);
+        $adapter->method('query')->willReturnCallback(
+            function (string $sql) use (&$calls): \Zend_Db_Statement_Interface {
+                $this->statements[] = $sql;
+                if (str_starts_with($sql, 'SELECT')) {
+                    // The read itself must happen while buffering is off.
+                    self::assertSame([false], $calls);
+                }
+                return $this->statementYielding([['entity_id' => '1']]);
+            }
+        );
+
+        $resourceConnection = $this->createMock(ResourceConnection::class);
+        $resourceConnection->method('getConnection')->willReturn($adapter);
+        $this->guard->method('assertReadOnly')->willReturn('SELECT entity_id FROM sales_order LIMIT 100');
+
+        $tool = new Query($this->config, $this->guard, $resourceConnection, $this->logger);
+        $tool->execute(['query' => 'SELECT entity_id FROM sales_order']);
+
+        self::assertSame([false, true], $calls, 'Buffering must be switched off, then restored.');
+    }
+
+    public function testResultBufferingIsRestoredWhenTheReadThrows(): void
+    {
+        $calls = [];
+        $pdo = $this->createMock(\PDO::class);
+        $pdo->method('getAttribute')->willReturn(true);
+        $pdo->method('setAttribute')->willReturnCallback(
+            static function (int $attribute, $value) use (&$calls): bool {
+                if ($attribute === \PDO::MYSQL_ATTR_USE_BUFFERED_QUERY) {
+                    $calls[] = $value;
+                }
+                return true;
+            }
+        );
+
+        $adapter = $this->getMockBuilder(\Magento\Framework\DB\Adapter\Pdo\Mysql::class)
+            ->disableOriginalConstructor()
+            ->onlyMethods(['query', 'fetchOne', 'getConnection', 'closeConnection'])
+            ->getMock();
+        $adapter->method('fetchOne')->willReturn('8.0.36');
+        $adapter->method('getConnection')->willReturn($pdo);
+        $adapter->method('query')->willReturnCallback(
+            function (string $sql): \Zend_Db_Statement_Interface {
+                if (str_starts_with($sql, 'SELECT')) {
+                    throw new \Zend_Db_Statement_Exception('SQLSTATE[42S22]: Column not found');
+                }
+                return $this->statementYielding([]);
+            }
+        );
+
+        $resourceConnection = $this->createMock(ResourceConnection::class);
+        $resourceConnection->method('getConnection')->willReturn($adapter);
+        $this->guard->method('assertReadOnly')->willReturn('SELECT bogus FROM sales_order LIMIT 100');
+
+        $tool = new Query($this->config, $this->guard, $resourceConnection, $this->logger);
+
+        try {
+            $tool->execute(['query' => 'SELECT bogus FROM sales_order']);
+            self::fail('The driver failure did not propagate.');
+        } catch (LocalizedException) {
+            self::assertSame([false, true], $calls, 'Buffering must be restored on the throw path too.');
+        }
+    }
+
+    public function testCursorThatWillNotCloseCostsTheConnection(): void
+    {
+        $statement = $this->createMock(\Zend_Db_Statement_Interface::class);
+        $statement->method('fetch')->willReturn(false);
+        $statement->method('closeCursor')->willThrowException(new \RuntimeException('cursor stuck'));
+
+        $adapter = $this->getMockBuilder(\Magento\Framework\DB\Adapter\Pdo\Mysql::class)
+            ->disableOriginalConstructor()
+            ->onlyMethods(['query', 'fetchOne', 'getConnection', 'closeConnection'])
+            ->getMock();
+        $adapter->method('fetchOne')->willReturn('8.0.36');
+        $adapter->method('getConnection')->willReturn(null);
+        $adapter->method('query')->willReturn($statement);
+        // An unbuffered cursor left open would break every later query on this connection.
+        $adapter->expects(self::once())->method('closeConnection');
+
+        $resourceConnection = $this->createMock(ResourceConnection::class);
+        $resourceConnection->method('getConnection')->willReturn($adapter);
+        $this->guard->method('assertReadOnly')->willReturn('SELECT entity_id FROM sales_order LIMIT 100');
+        $this->logger->expects(self::once())->method('warning');
+
+        $tool = new Query($this->config, $this->guard, $resourceConnection, $this->logger);
+        $tool->execute(['query' => 'SELECT entity_id FROM sales_order']);
     }
 
     public function testLimitArgumentReachesTheGuard(): void

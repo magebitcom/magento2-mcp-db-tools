@@ -15,9 +15,11 @@ because it is the highest-risk tool in the family:
   database.
 - **Allowlist-only.** The tool reads the tables an admin lists in **Allowed
   Tables** and nothing else — and refuses every query, `SELECT 1` included, while
-  that list is empty. A protected set (admin accounts, tokens, sessions,
-  `core_config_data`, the server's own schemas) is declared in the module's
-  `etc/di.xml` and stays unreadable even if it is listed as allowed.
+  that list is empty. A protected set (admin accounts, tokens, sessions, the cache
+  and session stores, this tool's own audit log, `core_config_data`, the server's
+  own schemas) is declared in the module's `etc/di.xml` and stays unreadable even
+  if it is listed as allowed. Secret-bearing column names (passwords, tokens,
+  session identifiers, card data) are refused on any table.
 - **Disabled by default.** Installing and enabling the module does nothing on its
   own — `magebit_mcp/db_tools/enabled` defaults to `0`. An admin must turn it on
   under Stores → Configuration → Magebit → MCP Server → **MCP Database Reader**.
@@ -92,13 +94,21 @@ what is executed and echoed back.
 Order of operations per call: the `enabled` flag → `{{table_name}}` substitution → the query
 guard → a session statement timeout and pinned `sql_mode` → execution. A rejection at any step
 comes back as an operator-facing message naming what was refused and, for configuration
-problems, the setting to change. Errors raised by the database itself (an unknown column, a
-query the server interrupted on the time limit) are surfaced with the driver's own message, so
-they can be acted on rather than guessed at.
+problems, the setting to change. Errors raised by the database about the statement itself (an
+unknown column, a missing table, a query the server interrupted on the time limit) are surfaced
+with the driver's own message, so they can be acted on rather than guessed at. Connection-level
+failures are deliberately *not* echoed — their messages describe the server and its credentials
+rather than the query — and go to `var/log/magebit_mcp.log` instead.
 
-Rows are read one at a time and the read stops as soon as the size limit is reached, so a query
-whose result set is far larger than the response limit is trimmed rather than loaded. The row
-cap bounds the number of rows but never their width, which is why the byte limit exists.
+Rows are read one at a time — with result buffering switched off for the duration, then restored
+— and the read stops as soon as the size limit is reached, so a query whose result set is far
+larger than the response limit is trimmed instead of being loaded into memory. The row cap
+bounds the number of rows but never their width, which is why the byte limit exists. Measured on
+a ~1 GB result set: no measurable increase in PHP peak memory.
+
+If the connection cannot be switched to unbuffered reads, the tool still runs but the whole
+result set is held in memory while it is read; that case is logged as a warning in
+`var/log/magebit_mcp.log`.
 
 **The statement timeout is mandatory.** It is applied with `max_execution_time` (MySQL 5.7.8+)
 or `max_statement_time` (MariaDB 10.1+), whichever the server supports. If neither is

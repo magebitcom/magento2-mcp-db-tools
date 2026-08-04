@@ -15,8 +15,8 @@ use Magento\Framework\Exception\LocalizedException;
  * Which tables the SQL tool may read. Two layers, and the order between them is the point:
  *
  * 1. **Protected set** — never readable, whatever else says otherwise. Injected as the
- *    `protectedTables` / `protectedIdentifiers` DI array arguments from this module's own
- *    `etc/di.xml`, deliberately neither a constant nor admin config. Weakening the set therefore
+ *    `protectedTables` / `protectedPrefixedIdentifiers` / `protectedIdentifiers` DI array arguments
+ *    from this module's own `etc/di.xml`, deliberately neither a constant nor admin config. Weakening the set therefore
  *    requires filesystem write access plus `setup:di:compile`, putting it out of reach of an
  *    admin-panel user, a stolen admin session, and anything the MCP surface itself can reach —
  *    while a project or satellite module can still *extend* it (its own credential tables) with a
@@ -62,16 +62,24 @@ class TableAccessPolicy
      *        wrappers (`custom_admin_user_map`) must be caught too.
      * @param array<array-key, string> $protectedIdentifiers Matched by strict equality only:
      *        server-owned single words (`mysql`, `sys`) that word-run matching would over-deny.
+     * @param array<array-key, string> $protectedPrefixedIdentifiers Matched exactly or behind this
+     *        install's table prefix: Magento tables whose names are single common words
+     *        (`session`, `cache`), where word-run matching would refuse ordinary columns.
      */
     public function __construct(
         private readonly DbToolsConfig $config,
         private readonly IdentifierMatcher $matcher,
         private readonly array $protectedTables = [],
-        private readonly array $protectedIdentifiers = []
+        private readonly array $protectedIdentifiers = [],
+        private readonly array $protectedPrefixedIdentifiers = []
     ) {
     }
 
     /**
+     * Three categories, narrowest first. Splitting them is what lets `session` protect the table
+     * (bare or prefixed) without refusing `customer_entity.session_cutoff`, which the wide matcher
+     * would — the column side of that trade lives in {@see ColumnDenyList}.
+     *
      * @param string $identifier
      * @return string|null The protected name that matched, for the rejection message.
      */
@@ -82,6 +90,12 @@ class TableAccessPolicy
         foreach ($this->protectedIdentifiers as $term) {
             if ($lower === strtolower($term)) {
                 return $lower;
+            }
+        }
+
+        foreach ($this->protectedPrefixedIdentifiers as $term) {
+            if ($this->matcher->matchesExactOrPrefixed($lower, $term)) {
+                return strtolower($term);
             }
         }
 
@@ -209,6 +223,12 @@ class TableAccessPolicy
     {
         foreach ($this->protectedIdentifiers as $term) {
             if (strtolower($entry) === strtolower($term)) {
+                return strtolower($term);
+            }
+        }
+
+        foreach ($this->protectedPrefixedIdentifiers as $term) {
+            if ($this->matcher->matchesExactOrPrefixed($entry, $term)) {
                 return strtolower($term);
             }
         }
