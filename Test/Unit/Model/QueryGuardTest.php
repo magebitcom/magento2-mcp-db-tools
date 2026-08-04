@@ -576,7 +576,9 @@ class QueryGuardTest extends TestCase
 
     public function testRejectsQualifiedStoredFunctionCall(): void
     {
-        $this->assertRejected('SELECT other_db.helper_totals(1) FROM customer_entity', 'not a permitted function');
+        // Refused by the qualified-call rule now, which is strictly more specific: the word before
+        // the `(` need not even be unknown for a qualified name to be a stored function.
+        $this->assertRejected('SELECT other_db.helper_totals(1) FROM customer_entity', 'schema-qualified');
     }
 
     public function testRejectsBacktickQuotedFunctionName(): void
@@ -586,8 +588,11 @@ class QueryGuardTest extends TestCase
 
     public function testRejectsFunctionNamedAfterAStructuralKeyword(): void
     {
-        // A quoted word before `(` never earns the structural exemption.
-        $this->assertRejected('SELECT `values`(1) FROM customer_entity', 'not a permitted function');
+        // A quoted word before `(` never earns the structural exemption. `ROW` rather than `VALUES`,
+        // which the keyword layer now denies outright — the quoted-flag rule still needs its own
+        // case, on a structural keyword that reaches layer 4b.
+        $this->assertRejected('SELECT `row`(1) FROM customer_entity', 'not a permitted function');
+        $this->assertRejected('SELECT `values`(1) FROM customer_entity', 'VALUES');
     }
 
     public function testRejectsFunctionNamedAfterANonReservedKeyword(): void
@@ -1729,7 +1734,8 @@ class QueryGuardTest extends TestCase
         // TRIGGERS and EVENTS embed statement bodies; TABLE STATUS reports per-table row counts.
         $this->assertRejected('SHOW TRIGGERS', 'SHOW');
         $this->assertRejected('SHOW EVENTS', 'SHOW');
-        $this->assertRejected('SHOW TABLE STATUS', 'SHOW');
+        // `SHOW TABLE STATUS` is now intercepted one layer earlier, by the `TABLE` keyword denial.
+        $this->assertRejected('SHOW TABLE STATUS', 'TABLE');
         $this->assertRejected('SHOW OPEN TABLES', 'SHOW');
         $this->assertRejected('SHOW FUNCTION STATUS', 'SHOW');
     }
@@ -1737,6 +1743,103 @@ class QueryGuardTest extends TestCase
     public function testRejectsShowTablesFromAProtectedSchema(): void
     {
         $this->assertRejected('SHOW TABLES FROM information_schema', 'information_schema');
+    }
+
+    // ------------------------------------------------ table-value constructors (security review)
+
+    /**
+     * `TABLE t` (MySQL 8.0.19+) is `SELECT * FROM t` written without a `*` and without naming a
+     * single column, so it defeated the allowlist, the column deny-list and the wildcard rule at
+     * once: as a UNION branch the name never reached a table position, and layers 6 and 7 had no
+     * token to reject. Refused as a keyword, which closes every spelling of the form.
+     *
+     * @return array<string, array{string}>
+     */
+    public static function tableStatementProvider(): array
+    {
+        return [
+            'union branch' => ['SELECT 1,2,3 UNION TABLE customer_entity'],
+            'union branch, single column' => ['SELECT 1 UNION TABLE sales_order_payment'],
+            'after a cte' => ['WITH x AS (SELECT 1 AS a) SELECT a FROM x UNION TABLE customer_entity'],
+            'union all branch' => ['SELECT 1 UNION ALL TABLE customer_entity'],
+            'parenthesised branch' => ['SELECT 1 UNION (TABLE customer_entity)'],
+            'intersect branch' => ['SELECT 1 INTERSECT TABLE customer_entity'],
+            'leading' => ['TABLE customer_entity'],
+            'derived table' => ['SELECT a FROM (TABLE customer_entity) x'],
+            'lower case' => ['select 1 union table customer_entity'],
+        ];
+    }
+
+    /**
+     * @dataProvider tableStatementProvider
+     * @param string $sql
+     * @return void
+     */
+    public function testRejectsTableStatement(string $sql): void
+    {
+        $this->assertRejected($sql, 'TABLE');
+    }
+
+    public function testRejectsValuesTableConstructor(): void
+    {
+        // Same family as `TABLE`: a row constructor usable as a set-operation branch. Nothing an
+        // explicit-column read query needs.
+        $this->assertRejected('SELECT 1 UNION VALUES ROW(1)', 'VALUES');
+    }
+
+    /**
+     * `NEXT VALUE FOR seq` advances a sequence — a write, inside a guard whose whole contract is
+     * read-only. It tokenises to three undenied words with no `(`, so neither the keyword layer nor
+     * the function allowlist engaged, and `FOR` ends the table list so the sequence name was never
+     * checked either.
+     *
+     * @return void
+     */
+    public function testRejectsSequenceValueForms(): void
+    {
+        $this->assertRejected('SELECT NEXT VALUE FOR my_sequence', 'NEXT VALUE FOR');
+        $this->assertRejected('SELECT PREVIOUS VALUE FOR my_sequence', 'PREVIOUS VALUE FOR');
+        $this->assertRejected('select next value for my_sequence', 'NEXT VALUE FOR');
+        $this->assertRejected(
+            'SELECT entity_id FROM customer_entity WHERE entity_id = (SELECT NEXT VALUE FOR s)',
+            'NEXT VALUE FOR'
+        );
+    }
+
+    /**
+     * The false positive the phrase rule exists to avoid: `value` is a column on every EAV value
+     * table in Magento, including three in the README's own starter allowlist. Denying the bare
+     * keyword would have made the tool useless for catalog data.
+     *
+     * @return void
+     */
+    public function testEavValueColumnStaysReadable(): void
+    {
+        $guard = $this->guard(allowedTables: ['catalog_product_entity_varchar', 'some_table']);
+
+        $this->assertSame(
+            'SELECT entity_id, value FROM catalog_product_entity_varchar LIMIT 100',
+            $guard->assertReadOnly('SELECT entity_id, value FROM catalog_product_entity_varchar')
+        );
+        $this->assertSame(
+            'SELECT value AS next FROM some_table LIMIT 100',
+            $guard->assertReadOnly('SELECT value AS next FROM some_table')
+        );
+    }
+
+    /**
+     * A built-in can never be schema-qualified, so `magento.count(1)` always resolves to a stored
+     * function — the one thing the function allowlist exists to stop. The allowlist only inspected
+     * the word touching the `(`, and the qualifier sat in a non-table position, so nothing checked
+     * either half.
+     *
+     * @return void
+     */
+    public function testRejectsSchemaQualifiedFunctionCall(): void
+    {
+        $this->assertRejected('SELECT magento.count(1) FROM customer_entity', 'magento.count');
+        $this->assertRejected('SELECT otherdb.helper_totals(1) FROM customer_entity', 'helper_totals');
+        $this->assertRejected('SELECT magento.`count`(1) FROM customer_entity', 'count');
     }
 
     // ------------------------------------------------ CTE scoping (fix round 1)

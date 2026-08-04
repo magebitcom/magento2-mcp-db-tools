@@ -302,6 +302,15 @@ tool's usability surface — an MCP client normally self-corrects from them in o
   `SET`, `LOCK`, `CALL`, `LOAD`, `PREPARE`, `FLUSH`, `KILL`, `INTO`/`OUTFILE`/`DUMPFILE`,
   `LOAD_FILE`, `SLEEP`, `BENCHMARK`, the `*_LOCK` family, the replication-wait family, and
   `SYS_EXEC`/`SYS_EVAL`.
+- **Table-value constructors** — `TABLE t` (MySQL 8.0.19+) and `VALUES ROW(…)` — are refused
+  anywhere, including as a `UNION` branch. `TABLE t` is `SELECT * FROM t` written with no `*` and
+  no column names, so it would otherwise return every column of a table while giving the wildcard
+  rule and the column deny-list nothing to reject. Cost: a backtick-quoted identifier literally
+  named `` `table` `` or `` `values` `` is refused too; neither exists in Magento.
+- **Sequence forms** — `NEXT VALUE FOR s` advances a sequence, which is a write, and
+  `PREVIOUS VALUE FOR s` reads one that was never allowlist-checked. Both phrases are refused. The
+  bare word `value` is *not* denied — it names a column on every EAV value table — so only the
+  three-word phrase is matched.
 - **Session and system variables** (`@name`, `@@name`, `@x := …`) are refused — a classic
   filter-evasion and state-mutation primitive. `@` inside a string literal is unaffected, so
   `email LIKE '%@example.com'` still works.
@@ -333,6 +342,9 @@ tool's usability surface — an MCP client normally self-corrects from them in o
 
 **Functions**
 
+- **A schema-qualified call is always refused.** `magento.count(1)` looks allowlisted if you only
+  read the word touching the `(`, but a built-in can never be schema-qualified, so a qualified name
+  always resolves to a stored function.
 - **Built-in read-only functions only** — roughly 200 of them: aggregates and window functions,
   string/hash, numeric, date-time, cast and control-flow, JSON accessors and constructors. Anything
   not on the list is refused, which is the only rule that can stop a **stored function or UDF**,

@@ -191,7 +191,10 @@ class Query implements ToolInterface, UnderlyingAclAwareInterface
             . '`TRIM(LEADING \'0\' FROM col)`, `SUBSTRING(col FROM 2 FOR 3)`, '
             . '`POSITION(\'x\' IN col)`.'
             . "\n- Also refused: `@`/`@@` variables, `INTO OUTFILE`, `SLEEP`/`BENCHMARK`/"
-            . '`GET_LOCK`, `/*! */` executable comments, and references to any other database.'
+            . '`GET_LOCK`, `/*! */` executable comments, references to any other database, the '
+            . 'table-value constructors `TABLE t` and `VALUES ROW(…)` (write `SELECT <columns> FROM '
+            . 't` instead), `NEXT VALUE FOR`/`PREVIOUS VALUE FOR`, and schema-qualified function '
+            . 'calls such as `db.count(1)`.'
             . "\nResponse: `columns`, `rows`, `row_count`, `limit_applied`, `truncated`, "
             . '`executed_sql`. `truncated` means there are probably more rows (the cap was hit) or '
             . 'the response was trimmed to fit its size limit — narrow the query rather than '

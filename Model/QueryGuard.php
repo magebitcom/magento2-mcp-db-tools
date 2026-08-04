@@ -99,6 +99,15 @@ class QueryGuard
         'DO', 'HANDLER', 'LOAD', 'PREPARE', 'EXECUTE', 'DEALLOCATE', 'SET', 'FLUSH', 'RESET', 'SHUTDOWN',
         'KILL', 'INSTALL', 'UNINSTALL', 'BINLOG', 'PURGE', 'OPTIMIZE', 'REPAIR', 'ANALYZE', 'ANALYSE',
         'CHECKSUM', 'PROCEDURE', 'INTO', 'OUTFILE', 'DUMPFILE', 'LOAD_FILE', 'SLEEP', 'BENCHMARK',
+        // Table-value constructors (MySQL 8.0.19+). `TABLE t` is `SELECT * FROM t` written with no
+        // `*` and no column names, so as a `UNION`/`INTERSECT`/`EXCEPT` branch it slipped past the
+        // wildcard rule and the column deny-list — nothing to reject — while the table name never
+        // entered a table position and so was never allowlisted. `VALUES ROW(…)` is the same family.
+        // Denied flat: neither has a place in an explicit-column read query, and a flat deny closes
+        // every spelling at once rather than teaching the positional scanner a new grammar.
+        // (`VALUES` also remains in STRUCTURAL_KEYWORDS; that entry is now unreachable, and
+        // harmless, since this layer runs first.)
+        'TABLE', 'VALUES',
         'GET_LOCK', 'RELEASE_LOCK', 'IS_USED_LOCK', 'IS_FREE_LOCK', 'SYS_EXEC', 'SYS_EVAL',
         // Row-collapsing aggregates: they defeat the row limit by returning a whole column in
         // one value, bounded only by max_allowed_packet.
@@ -619,11 +628,49 @@ class QueryGuard
                 }
             }
 
+            $this->assertNotASequenceValueForm($tokens, $index, $keyword);
+
             if (in_array($keyword, self::DENIED_KEYWORDS, true)) {
                 throw new LocalizedException(
                     __('The keyword `%1` is not permitted in a read-only query.', $keyword)
                 );
             }
+        }
+    }
+
+    /**
+     * `NEXT VALUE FOR seq` advances a sequence — a write, in a guard whose whole contract is
+     * read-only — and neither form's operand ever reaches a table position, so the sequence is not
+     * allowlisted either. Matched as a three-token phrase rather than by denying the bare word
+     * `VALUE`: that word names a column on every EAV value table in Magento, three of which are in
+     * the module's own suggested allowlist, so denying it would cost far more than it buys.
+     *
+     * @param list<SqlToken> $tokens
+     * @param int $index
+     * @param string $keyword
+     * @return void
+     * @throws LocalizedException
+     */
+    private function assertNotASequenceValueForm(array $tokens, int $index, string $keyword): void
+    {
+        if ($keyword !== 'NEXT' && $keyword !== 'PREVIOUS') {
+            return;
+        }
+
+        $value = $tokens[$index + 1] ?? null;
+        $for = $tokens[$index + 2] ?? null;
+
+        if (
+            $value !== null && $value['type'] === self::TYPE_WORD && strtoupper($value['value']) === 'VALUE'
+            && $for !== null && $for['type'] === self::TYPE_WORD && strtoupper($for['value']) === 'FOR'
+        ) {
+            throw new LocalizedException(
+                __(
+                    '`%1 VALUE FOR` reads or advances a database sequence and is not permitted in a '
+                    . 'read-only query.',
+                    $keyword
+                )
+            );
         }
     }
 
@@ -648,6 +695,21 @@ class QueryGuard
             $next = $tokens[$index + 1] ?? null;
             if ($next === null || $next['type'] !== self::TYPE_PUNCT || $next['value'] !== '(') {
                 continue;
+            }
+
+            // A built-in can never be schema-qualified, so `db.count(1)` always resolves to a stored
+            // function even though the word touching the `(` is allowlisted. The qualifier sits in a
+            // non-table position and is not validated anywhere either, so the shape is refused whole.
+            $previous = $tokens[$index - 1] ?? null;
+            if ($previous !== null && $previous['type'] === self::TYPE_PUNCT && $previous['value'] === '.') {
+                throw new LocalizedException(
+                    __(
+                        '`%1.%2()` is a schema-qualified function call. Only stored functions can be '
+                        . 'qualified, and those are always refused; built-in functions never are.',
+                        $tokens[$index - 2]['value'] ?? '',
+                        $token['value']
+                    )
+                );
             }
 
             $name = strtoupper($token['value']);
