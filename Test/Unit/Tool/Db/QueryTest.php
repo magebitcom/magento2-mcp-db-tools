@@ -28,6 +28,12 @@ class QueryTest extends TestCase
     /** @var list<string> */
     private array $statements = [];
 
+    /** @var int Rows actually pulled from the driver, so early stops are observable. */
+    private int $fetchedRows = 0;
+
+    /** @var list<array<string, mixed>> */
+    private array $rowsToStream = [];
+
     /** @var DbToolsConfig&MockObject */
     private DbToolsConfig $config;
 
@@ -49,6 +55,7 @@ class QueryTest extends TestCase
     protected function setUp(): void
     {
         $this->statements = [];
+        $this->fetchedRows = 0;
 
         $this->config = $this->createMock(DbToolsConfig::class);
         $this->config->method('isEnabled')->willReturn(true);
@@ -57,6 +64,8 @@ class QueryTest extends TestCase
 
         $this->guard = $this->createMock(QueryGuard::class);
         $this->connection = $this->createMock(AdapterInterface::class);
+        // MySQL unless a test says otherwise; the flavour picks the timeout variable.
+        $this->connection->method('fetchOne')->willReturn('8.0.36');
         $this->resourceConnection = $this->createMock(ResourceConnection::class);
         $this->resourceConnection->method('getConnection')->willReturn($this->connection);
         $this->logger = $this->createMock(LoggerInterface::class);
@@ -71,7 +80,8 @@ class QueryTest extends TestCase
     }
 
     /**
-     * Records every statement the tool sends, in order, and answers `fetchAll` with $rows.
+     * Records every statement the tool sends, in order, and streams $rows from the statement each
+     * `query()` call returns.
      *
      * @param list<array<string, mixed>> $rows
      * @return void
@@ -79,17 +89,37 @@ class QueryTest extends TestCase
     private function recordStatements(array $rows = []): void
     {
         $this->connection->method('query')->willReturnCallback(
-            function (string $sql) {
+            function (string $sql): \Zend_Db_Statement_Interface {
                 $this->statements[] = $sql;
-                return $this->createMock(\Zend_Db_Statement_Interface::class);
+                return $this->statementYielding($this->rowsToStream);
             }
         );
-        $this->connection->method('fetchAll')->willReturnCallback(
-            function (string $sql) use ($rows): array {
-                $this->statements[] = $sql;
-                return $rows;
+        $this->rowsToStream = $rows;
+    }
+
+    /**
+     * A statement mock that hands out one row per `fetch()` call and then `false`, so a test can
+     * see how many rows the tool actually pulled.
+     *
+     * @param list<array<string, mixed>> $rows
+     * @return \Zend_Db_Statement_Interface&MockObject
+     */
+    private function statementYielding(array $rows): \Zend_Db_Statement_Interface
+    {
+        $statement = $this->createMock(\Zend_Db_Statement_Interface::class);
+        $cursor = 0;
+        $statement->method('fetch')->willReturnCallback(
+            function () use ($rows, &$cursor) {
+                if (!isset($rows[$cursor])) {
+                    return false;
+                }
+                $this->fetchedRows++;
+
+                return $rows[$cursor++];
             }
         );
+
+        return $statement;
     }
 
     /**
@@ -154,13 +184,20 @@ class QueryTest extends TestCase
     {
         $this->guard->method('assertReadOnly')
             ->willThrowException(new LocalizedException(__('`*` is not permitted.')));
+        $this->recordStatements([['entity_id' => '1']]);
 
-        $this->resourceConnection->expects(self::never())->method('getConnection');
+        try {
+            $this->tool()->execute(['query' => 'SELECT * FROM sales_order']);
+            self::fail('The guard rejection did not propagate.');
+        } catch (LocalizedException $exception) {
+            self::assertSame('`*` is not permitted.', $exception->getMessage());
+        }
 
-        $this->expectException(LocalizedException::class);
-        $this->expectExceptionMessage('`*` is not permitted.');
-
-        $this->tool()->execute(['query' => 'SELECT * FROM sales_order']);
+        // Asserted as "no statement was issued" rather than "no connection was obtained": the real
+        // ResourceConnection::getTableName() opens a connection while substituting a placeholder, so
+        // only the absence of a statement is a property of the production code path.
+        self::assertSame([], $this->statements);
+        self::assertSame(0, $this->fetchedRows);
     }
 
     public function testGuardConfigurationMessageSurfacesVerbatim(): void
@@ -293,6 +330,11 @@ class QueryTest extends TestCase
         self::assertTrue($response['truncated']);
         self::assertSame(count($response['rows']), $response['row_count']);
         self::assertLessThanOrEqual(Query::MAX_PAYLOAD_BYTES, strlen((string) json_encode($response)));
+
+        // The point of streaming: the rows past the budget are never pulled into PHP at all. One
+        // extra fetch is expected — the row that breaches the budget is read, measured, dropped.
+        self::assertSame($response['row_count'] + 1, $this->fetchedRows);
+        self::assertLessThan(40, $this->fetchedRows);
     }
 
     public function testSingleRowLargerThanThePayloadCapIsRejected(): void
@@ -311,6 +353,10 @@ class QueryTest extends TestCase
     {
         $this->guard->method('assertReadOnly')->willReturn('SELECT entity_id FROM sales_order LIMIT 100');
         $this->recordStatements([['entity_id' => '1']]);
+        // A healthy install must log nothing at all: the timeout variable is chosen by flavour.
+        $this->logger->expects(self::never())->method('warning');
+        $this->logger->expects(self::never())->method('info');
+        $this->logger->expects(self::never())->method('critical');
 
         $this->runTool(['query' => 'SELECT entity_id FROM sales_order']);
 
@@ -321,25 +367,46 @@ class QueryTest extends TestCase
         self::assertSame('SELECT entity_id FROM sales_order LIMIT 100', $this->statements[2]);
     }
 
-    public function testMariaDbEquivalentIsIssuedWhenMaxExecutionTimeIsUnknown(): void
+    public function testMariaDbGetsItsOwnTimeoutVariableFirstAndLogsNothing(): void
+    {
+        $connection = $this->createMock(AdapterInterface::class);
+        $connection->method('fetchOne')->willReturn('10.6.16-MariaDB-1:10.6.16+maria~ubu2004');
+        $connection->method('query')->willReturnCallback(
+            function (string $sql): \Zend_Db_Statement_Interface {
+                $this->statements[] = $sql;
+                return $this->statementYielding([['entity_id' => '1']]);
+            }
+        );
+        $resourceConnection = $this->createMock(ResourceConnection::class);
+        $resourceConnection->method('getConnection')->willReturn($connection);
+
+        $this->guard->method('assertReadOnly')->willReturn('SELECT entity_id FROM sales_order LIMIT 100');
+        $this->logger->expects(self::never())->method('warning');
+        $this->logger->expects(self::never())->method('info');
+        $this->logger->expects(self::never())->method('critical');
+
+        $tool = new Query($this->config, $this->guard, $resourceConnection, $this->logger);
+        $tool->execute(['query' => 'SELECT entity_id FROM sales_order']);
+
+        self::assertSame('SET SESSION max_statement_time = 10', $this->statements[0]);
+        self::assertStringNotContainsString('max_execution_time', implode(' ', $this->statements));
+    }
+
+    public function testFallbackTimeoutVariableIsUsedAndLoggedBelowWarning(): void
     {
         $this->guard->method('assertReadOnly')->willReturn('SELECT entity_id FROM sales_order LIMIT 100');
-
         $this->connection->method('query')->willReturnCallback(
-            function (string $sql) {
+            function (string $sql): \Zend_Db_Statement_Interface {
                 $this->statements[] = $sql;
                 if (str_contains($sql, 'max_execution_time')) {
                     throw new \RuntimeException('Unknown system variable');
                 }
-                return $this->createMock(\Zend_Db_Statement_Interface::class);
+                return $this->statementYielding([['entity_id' => '1']]);
             }
         );
-        $this->connection->method('fetchAll')->willReturnCallback(
-            function (string $sql): array {
-                $this->statements[] = $sql;
-                return [['entity_id' => '1']];
-            }
-        );
+        $this->logger->expects(self::never())->method('warning');
+        $this->logger->expects(self::never())->method('critical');
+        $this->logger->expects(self::once())->method('info');
 
         $response = $this->runTool(['query' => 'SELECT entity_id FROM sales_order']);
 
@@ -347,28 +414,88 @@ class QueryTest extends TestCase
         self::assertSame(1, $response['row_count']);
     }
 
-    public function testSessionGuardFailureIsNonFatal(): void
+    public function testQueryIsRefusedWhenNoStatementTimeoutCanBeApplied(): void
     {
         $this->guard->method('assertReadOnly')->willReturn('SELECT entity_id FROM sales_order LIMIT 100');
-
         $this->connection->method('query')->willReturnCallback(
             function (string $sql): void {
                 $this->statements[] = $sql;
-                throw new \RuntimeException('SET refused');
+                throw new \RuntimeException('Unknown system variable');
             }
         );
-        $this->connection->method('fetchAll')->willReturnCallback(
-            function (string $sql): array {
+        $this->logger->expects(self::once())->method('critical');
+
+        try {
+            $this->tool()->execute(['query' => 'SELECT entity_id FROM sales_order']);
+            self::fail('A query with no enforceable time limit was allowed to run.');
+        } catch (LocalizedException $exception) {
+            self::assertStringContainsString('max_execution_time', $exception->getMessage());
+            self::assertStringContainsString('max_statement_time', $exception->getMessage());
+        }
+
+        // Both rungs tried, then nothing else — the query itself was never issued.
+        self::assertCount(2, $this->statements);
+        self::assertSame(0, $this->fetchedRows);
+    }
+
+    public function testSqlModePinFailureIsNonFatalAndIsNotRetriedByAssignment(): void
+    {
+        $this->guard->method('assertReadOnly')->willReturn('SELECT entity_id FROM sales_order LIMIT 100');
+        $this->connection->method('query')->willReturnCallback(
+            function (string $sql): \Zend_Db_Statement_Interface {
                 $this->statements[] = $sql;
-                return [['entity_id' => '1']];
+                if (str_contains($sql, 'sql_mode')) {
+                    throw new \RuntimeException('Variable sql_mode cannot be set');
+                }
+                return $this->statementYielding([['entity_id' => '1']]);
             }
         );
-        $this->logger->expects(self::atLeastOnce())->method('warning');
+        $this->logger->expects(self::once())->method('warning');
 
         $response = $this->runTool(['query' => 'SELECT entity_id FROM sales_order']);
 
         self::assertSame(1, $response['row_count']);
+        // Exactly one sql_mode attempt: assigning a literal mode set would drop the session's
+        // existing modes (STRICT_TRANS_TABLES among them) for the rest of the request.
+        self::assertCount(1, array_filter($this->statements, static fn (string $s): bool => str_contains($s, 'sql_mode')));
         self::assertSame('SELECT entity_id FROM sales_order LIMIT 100', $this->statements[count($this->statements) - 1]);
+    }
+
+    public function testDriverErrorOnExecutionSurfacesTheServerMessage(): void
+    {
+        $this->guard->method('assertReadOnly')->willReturn('SELECT bogus FROM sales_order LIMIT 100');
+        $this->connection->method('query')->willReturnCallback(
+            function (string $sql): \Zend_Db_Statement_Interface {
+                $this->statements[] = $sql;
+                if (str_starts_with($sql, 'SELECT')) {
+                    throw new \RuntimeException("SQLSTATE[42S22]: Unknown column 'bogus' in 'field list'");
+                }
+                return $this->statementYielding([]);
+            }
+        );
+
+        try {
+            $this->tool()->execute(['query' => 'SELECT bogus FROM sales_order']);
+            self::fail('A driver error was swallowed.');
+        } catch (LocalizedException $exception) {
+            self::assertStringContainsString("Unknown column 'bogus'", $exception->getMessage());
+            self::assertStringContainsString('10-second', $exception->getMessage());
+        }
+    }
+
+    public function testDriverErrorWhileStreamingSurfacesTheServerMessage(): void
+    {
+        $this->guard->method('assertReadOnly')->willReturn('SELECT entity_id FROM sales_order LIMIT 100');
+        $statement = $this->createMock(\Zend_Db_Statement_Interface::class);
+        $statement->method('fetch')->willThrowException(
+            new \RuntimeException('SQLSTATE[70100]: Query execution was interrupted, max_statement_time exceeded')
+        );
+        $this->connection->method('query')->willReturn($statement);
+
+        $this->expectException(LocalizedException::class);
+        $this->expectExceptionMessageMatches('/max_statement_time exceeded/');
+
+        $this->tool()->execute(['query' => 'SELECT entity_id FROM sales_order']);
     }
 
     public function testLimitArgumentReachesTheGuard(): void
@@ -521,6 +648,8 @@ class QueryTest extends TestCase
             'builtin functions only' => ['stored function'],
             'group concat denied' => ['GROUP_CONCAT'],
             'json arrayagg denied' => ['JSON_ARRAYAGG'],
+            'arithmetic multiplication refused' => ['SUM(qty * price)'],
+            'substitution is textual' => ['string literals included'],
         ];
     }
 }

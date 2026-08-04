@@ -41,8 +41,12 @@ use Throwable;
  * 4. the session guards: a statement timeout and a pinned `sql_mode`, both built from our own
  *    literals and never from user input. The timeout is load-bearing rather than decorative: the
  *    guard bounds the *shape* of a query and the number of rows returned, not the work done, so an
- *    unbounded cross join or a wide hashing scan is limited only by this;
- * 5. execution and response shaping.
+ *    unbounded cross join or a wide hashing scan is limited only by this — which is why a server
+ *    that accepts neither timeout variable gets the query refused rather than run unbounded;
+ * 5. **streamed** execution: rows are pulled one at a time and the read stops at the byte budget,
+ *    so a result set far larger than {@see self::MAX_PAYLOAD_BYTES} cannot be materialised in PHP.
+ *    The guard's row cap bounds the number of rows, never their width, so this is the only bound on
+ *    the size of what a single query can pull into the process.
  *
  * **Audit note:** the executed SQL is written to `magebit_mcp_audit_log` verbatim (capped at
  * {@see self::AUDIT_SQL_LENGTH} characters) and is *not* PII-redacted, because it is SQL rather
@@ -73,6 +77,14 @@ class Query implements ToolInterface, UnderlyingAclAwareInterface
     private const MAX_QUERY_LENGTH = 8000;
 
     private const JSON_FLAGS = JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE;
+
+    /**
+     * Memoised server flavour: the timeout variable's name differs between MySQL and MariaDB, and
+     * probing in the wrong order would log a failure on every healthy call.
+     *
+     * @var bool|null
+     */
+    private ?bool $isMariaDb = null;
 
     /**
      * @param DbToolsConfig $config
@@ -125,8 +137,11 @@ class Query implements ToolInterface, UnderlyingAclAwareInterface
             . 'A protected set is refused even when listed: admin accounts and passwords, MCP and '
             . 'OAuth tokens, sessions, `core_config_data`, and the server schemas '
             . '`information_schema` / `mysql` / `sys` / `performance_schema`.'
-            . "\n- Explicit columns: `SELECT *` and `t.*` are refused so that protected columns "
-            . 'cannot come back by accident. `COUNT(*)` is the one accepted `*`. Columns whose '
+            . "\n- No `*` anywhere except `COUNT(*)`: `SELECT *` and `t.*` are refused so that "
+            . 'protected columns cannot come back by accident, and this also refuses arithmetic '
+            . 'multiplication — `SUM(qty * price)` will not run, and SQL has no other multiplication '
+            . 'operator, so compute products from the returned columns on your side instead. '
+            . 'Columns whose '
             . 'names carry secrets (`password…`, `…token…`, `secret`, `api_key`, `cc_…`) are '
             . 'refused wherever they appear. Two selected columns with the same name collapse into '
             . 'one in the response, so alias them (`o.entity_id AS order_id`).'
@@ -136,7 +151,9 @@ class Query implements ToolInterface, UnderlyingAclAwareInterface
             . 'the final clause.'
             . "\n- Table names: write `{{table_name}}` (e.g. `{{sales_order}}`) and the real, "
             . 'prefixed table name is substituted for you; do not guess the table prefix. Braces '
-            . 'that are not a `{{name}}` placeholder are refused.'
+            . 'that are not a `{{name}}` placeholder are refused. The substitution is textual and '
+            . 'happens everywhere, string literals included, so do not write `{{…}}` inside a '
+            . 'literal you want left alone.'
             . "\n- String literals: single quotes only (`\"` is refused) and no backslashes at all "
             . '— embed a quote by doubling it (`\'\'`), and match a literal `_` or `%` with the '
             . 'ESCAPE clause: `LIKE \'a!_b\' ESCAPE \'!\'`.'
@@ -231,17 +248,16 @@ class Query implements ToolInterface, UnderlyingAclAwareInterface
         $connection = $this->resourceConnection->getConnection();
         $this->applySessionGuards($connection);
 
-        $rows = $this->normaliseRows($connection->fetchAll($executable, [], \PDO::FETCH_ASSOC));
-        $trimmed = $this->trimToPayloadBudget($rows, $executable);
+        $result = $this->streamRows($connection, $executable);
         $limitApplied = $this->queryGuard->findRowLimit($executable);
-        $rowCount = count($trimmed['rows']);
+        $rowCount = count($result['rows']);
 
         $payload = [
-            'columns' => array_keys($rows[0] ?? []),
-            'rows' => $trimmed['rows'],
+            'columns' => $result['columns'],
+            'rows' => $result['rows'],
             'row_count' => $rowCount,
             'limit_applied' => $limitApplied,
-            'truncated' => $trimmed['truncated'] || ($limitApplied !== null && $rowCount === $limitApplied),
+            'truncated' => $result['truncated'] || ($limitApplied !== null && $rowCount === $limitApplied),
             'executed_sql' => $executable,
         ];
 
@@ -334,112 +350,227 @@ class Query implements ToolInterface, UnderlyingAclAwareInterface
     }
 
     /**
-     * Statement timeout and a pinned `sql_mode`, both from our own literals. Each failure degrades
-     * rather than aborting — server flavours differ on the variable names — but it is logged,
-     * because losing the timeout means losing the only bound on how much work a query may do.
+     * Statement timeout and a pinned `sql_mode`, both from our own literals. The timeout is the
+     * only bound on how much work a query may do, so a server that accepts neither variable gets
+     * the query refused; the `sql_mode` pin is belt-and-braces and degrades with a warning.
      *
      * @param AdapterInterface $connection
      * @return void
+     * @throws LocalizedException When no statement timeout could be applied.
      */
     private function applySessionGuards(AdapterInterface $connection): void
     {
         $seconds = max(1, $this->config->getStatementTimeoutSeconds());
+        $mysqlForm = 'SET SESSION max_execution_time = ' . ($seconds * 1000);
+        $mariaDbForm = 'SET SESSION max_statement_time = ' . $seconds;
 
-        // MySQL 5.7.8+ (milliseconds, SELECT only), then the MariaDB 10.1+ equivalent (seconds).
-        if (!$this->tryStatement($connection, 'SET SESSION max_execution_time = ' . ($seconds * 1000))) {
-            $this->tryStatement($connection, 'SET SESSION max_statement_time = ' . $seconds);
+        // Ordered by server flavour, not tried blindly: MariaDB has no `max_execution_time` and
+        // MySQL has no `max_statement_time`, so probing in the wrong order would log a failure on
+        // every healthy call and drown the one case that matters.
+        $forms = $this->isMariaDb($connection) ? [$mariaDbForm, $mysqlForm] : [$mysqlForm, $mariaDbForm];
+        $failures = [];
+
+        foreach ($forms as $form) {
+            $failure = $this->tryStatement($connection, $form);
+            if ($failure === null) {
+                if ($failures !== []) {
+                    $this->logger->info(
+                        'db.query applied its statement timeout with the fallback variable.',
+                        ['applied' => $form, 'rejected' => $failures]
+                    );
+                }
+
+                // `sql_mode`: `NO_BACKSLASH_ESCAPES` makes the server's literal boundaries match the
+                // guard's, which refuses backslashes outright. Appended rather than assigned — this
+                // is the shared request connection, so replacing the mode set would change
+                // behaviour for everything else running on it.
+                $sqlModeFailure = $this->tryStatement(
+                    $connection,
+                    "SET SESSION sql_mode = CONCAT(@@SESSION.sql_mode, ',NO_BACKSLASH_ESCAPES')"
+                );
+                if ($sqlModeFailure !== null) {
+                    // Deliberately no `SET SESSION sql_mode = '…'` fallback: assigning would drop
+                    // modes such as STRICT_TRANS_TABLES for the rest of the request. Skipping the
+                    // pin is safe — the guard refuses backslashes and `"` whatever the mode is.
+                    $this->logger->warning(
+                        'db.query could not pin sql_mode; continuing without the pin.',
+                        ['exception' => $sqlModeFailure]
+                    );
+                }
+
+                return;
+            }
+
+            $failures[$form] = $failure;
         }
 
-        // `NO_BACKSLASH_ESCAPES` makes the server's literal boundaries match the guard's, which
-        // refuses backslashes outright. Appended to the session's existing modes so nothing the
-        // rest of the request depends on is dropped; the plain form is the fallback.
-        $appended = "SET SESSION sql_mode = CONCAT(@@SESSION.sql_mode, ',NO_BACKSLASH_ESCAPES')";
-        if (!$this->tryStatement($connection, $appended)) {
-            $this->tryStatement($connection, "SET SESSION sql_mode = 'NO_BACKSLASH_ESCAPES'");
-        }
+        $this->logger->critical(
+            'db.query could not apply any statement timeout and refused to run the query.',
+            ['rejected' => $failures]
+        );
+
+        throw new LocalizedException(
+            __(
+                'The query was not run: this server accepts neither `max_execution_time` '
+                . '(MySQL 5.7.8+) nor `max_statement_time` (MariaDB 10.1+), so the %1-second '
+                . 'statement time limit cannot be enforced — and without it one query could occupy '
+                . 'the database indefinitely.',
+                $seconds
+            )
+        );
     }
 
     /**
      * @param AdapterInterface $connection
      * @param string $statement
-     * @return bool Whether the server accepted it.
+     * @return string|null The server's message, or null when the statement was accepted.
      */
-    private function tryStatement(AdapterInterface $connection, string $statement): bool
+    private function tryStatement(AdapterInterface $connection, string $statement): ?string
     {
         try {
             $connection->query($statement);
 
-            return true;
+            return null;
         } catch (Throwable $exception) {
-            $this->logger->warning(
-                'db.query could not apply a session guard; continuing without it.',
-                ['statement' => $statement, 'exception' => $exception->getMessage()]
-            );
-
-            return false;
+            return $exception->getMessage();
         }
     }
 
     /**
-     * @param array<array-key, mixed> $rows
-     * @return list<array<string, mixed>>
+     * @param AdapterInterface $connection
+     * @return bool
      */
-    private function normaliseRows(array $rows): array
+    private function isMariaDb(AdapterInterface $connection): bool
     {
-        $normalised = [];
-
-        foreach ($rows as $row) {
-            if (!is_array($row)) {
-                continue;
+        if ($this->isMariaDb === null) {
+            try {
+                $version = $connection->fetchOne('SELECT VERSION()');
+            } catch (Throwable) {
+                $version = null;
             }
 
-            $columns = [];
-            foreach ($row as $name => $value) {
-                $columns[(string) $name] = $value;
-            }
-            $normalised[] = $columns;
+            $this->isMariaDb = is_string($version) && stripos($version, 'mariadb') !== false;
         }
 
-        return $normalised;
+        return $this->isMariaDb;
     }
 
     /**
-     * Drops trailing rows until the serialised payload fits {@see self::MAX_PAYLOAD_BYTES}.
+     * Runs the statement and pulls rows one at a time, stopping at the byte budget. Streaming is
+     * the point: `fetchAll()` would materialise the whole result set in PHP before any cap could
+     * apply, so a 1 GB read of wide `TEXT` columns would be a fatal error rather than a refusal.
      *
-     * @param list<array<string, mixed>> $rows
-     * @param string $executable Echoed back in the response, so it counts against the budget.
-     * @return array{rows: list<array<string, mixed>>, truncated: bool}
-     * @throws LocalizedException When even the first row is larger than the cap.
+     * @param AdapterInterface $connection
+     * @param string $executable Executed verbatim; also echoed back, so it counts against the budget.
+     * @return array{columns: list<string>, rows: list<array<string, mixed>>, truncated: bool}
+     * @throws LocalizedException On any driver failure, or when the first row alone exceeds the cap.
      */
-    private function trimToPayloadBudget(array $rows, string $executable): array
+    private function streamRows(AdapterInterface $connection, string $executable): array
     {
         $budget = self::MAX_PAYLOAD_BYTES - self::PAYLOAD_OVERHEAD_BYTES - strlen($executable);
+        $statement = $this->runStatement($connection, $executable);
+        $columns = [];
+        $rows = [];
         $used = 0;
-        $kept = [];
+        $truncated = false;
 
-        foreach ($rows as $row) {
-            // +1 for the comma that will separate this row from the previous one.
-            $size = strlen($this->encode($row)) + 1;
+        try {
+            while (($row = $this->fetchRow($statement)) !== null) {
+                // +1 for the comma that will separate this row from the previous one.
+                $size = strlen($this->encode($row)) + 1;
 
-            if ($used + $size > $budget) {
-                if ($kept === []) {
-                    throw new LocalizedException(
-                        __(
-                            'The first row alone is larger than the %1 KB response limit. Select fewer '
-                            . 'or narrower columns, or use LEFT()/SUBSTRING() to shorten long text values.',
-                            (int) round(self::MAX_PAYLOAD_BYTES / 1024)
-                        )
-                    );
+                if ($used + $size > $budget) {
+                    if ($rows === []) {
+                        throw new LocalizedException(
+                            __(
+                                'The first row alone is larger than the %1 KB response limit. Select fewer '
+                                . 'or narrower columns, or use LEFT()/SUBSTRING() to shorten long text values.',
+                                (int) round(self::MAX_PAYLOAD_BYTES / 1024)
+                            )
+                        );
+                    }
+
+                    $truncated = true;
+                    break;
                 }
 
-                return ['rows' => $kept, 'truncated' => true];
+                if ($columns === []) {
+                    $columns = array_keys($row);
+                }
+                $rows[] = $row;
+                $used += $size;
             }
-
-            $kept[] = $row;
-            $used += $size;
+        } finally {
+            try {
+                $statement->closeCursor();
+            } catch (Throwable) {
+                // A cursor we could not close is the driver's problem, not the operator's.
+            }
         }
 
-        return ['rows' => $kept, 'truncated' => false];
+        return ['columns' => $columns, 'rows' => $rows, 'truncated' => $truncated];
+    }
+
+    /**
+     * @param AdapterInterface $connection
+     * @param string $executable
+     * @return \Zend_Db_Statement_Interface
+     * @throws LocalizedException
+     */
+    private function runStatement(AdapterInterface $connection, string $executable): \Zend_Db_Statement_Interface
+    {
+        try {
+            return $connection->query($executable);
+        } catch (Throwable $exception) {
+            throw $this->driverFailure($exception);
+        }
+    }
+
+    /**
+     * @param \Zend_Db_Statement_Interface $statement
+     * @return array<string, mixed>|null Null at the end of the result set.
+     * @throws LocalizedException
+     */
+    private function fetchRow(\Zend_Db_Statement_Interface $statement): ?array
+    {
+        try {
+            $row = $statement->fetch(\PDO::FETCH_ASSOC);
+        } catch (Throwable $exception) {
+            throw $this->driverFailure($exception);
+        }
+
+        if (!is_array($row)) {
+            return null;
+        }
+
+        $columns = [];
+        foreach ($row as $name => $value) {
+            $columns[(string) $name] = $value;
+        }
+
+        return $columns;
+    }
+
+    /**
+     * The driver's own message is echoed back on purpose: `Unknown column 'x'` is the one error an
+     * agent can self-correct from and a timeout kill is the one an operator needs to see. The
+     * operator wrote the SQL and the guard already bounded which tables it could reach.
+     *
+     * @param Throwable $exception
+     * @return LocalizedException
+     */
+    private function driverFailure(Throwable $exception): LocalizedException
+    {
+        return new LocalizedException(
+            __(
+                'The database could not complete the query: %1. If the server interrupted it on the '
+                . '%2-second statement time limit, narrow the query — fewer rows, fewer joins, or a '
+                . 'tighter WHERE.',
+                $exception->getMessage(),
+                max(1, $this->config->getStatementTimeoutSeconds())
+            ),
+            $exception instanceof \Exception ? $exception : null
+        );
     }
 
     /**

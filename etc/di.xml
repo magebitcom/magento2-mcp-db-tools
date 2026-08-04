@@ -41,7 +41,23 @@
                 <item name="magebit_mcp_oauth_client" xsi:type="string">magebit_mcp_oauth_client</item>
                 <item name="magebit_mcp_oauth_auth_code" xsi:type="string">magebit_mcp_oauth_auth_code</item>
                 <item name="magebit_mcp_oauth_refresh_token" xsi:type="string">magebit_mcp_oauth_refresh_token</item>
+                <!-- In-flight authorizations: params_json carries client_id, redirect_uri, state,
+                     code_challenge and scope, none of which the column deny-list can see. -->
+                <item name="magebit_mcp_oauth_authorize_handoff" xsi:type="string">magebit_mcp_oauth_authorize_handoff</item>
+                <!-- This tool's own audit trail holds unredacted SQL, literals included, so
+                     allowlisting it would let one operator read another operator's queries. -->
+                <item name="magebit_mcp_audit_log" xsi:type="string">magebit_mcp_audit_log</item>
                 <item name="persistent_session" xsi:type="string">persistent_session</item>
+                <!-- `session/save = db`: session_id + session_data for admin and customer sessions
+                     alike, i.e. everything needed to hijack one. Innocuous-looking enough that an
+                     operator trimming a starter allowlist might keep it. -->
+                <item name="session" xsi:type="string">session</item>
+                <!-- DB cache backend: `SELECT data FROM cache` returns the config cache (decrypted
+                     values included) and rendered block HTML. -->
+                <item name="cache" xsi:type="string">cache</item>
+                <!-- Credential-bearing; belongs with oauth_token on principle, even though the
+                     column deny-list already catches its token columns. -->
+                <item name="admin_adobe_ims_webapi" xsi:type="string">admin_adobe_ims_webapi</item>
                 <item name="password_reset_request_event" xsi:type="string">password_reset_request_event</item>
                 <!-- Encrypted payment-gateway credentials and API keys; system.config.get is the
                      path that redacts them. -->

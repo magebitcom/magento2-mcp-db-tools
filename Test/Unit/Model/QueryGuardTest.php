@@ -654,7 +654,9 @@ class QueryGuardTest extends TestCase
         return [
             'admin_user' => ['SELECT c.email FROM admin_user c', 'admin_user'],
             'admin_passwords' => ['SELECT password_expires FROM admin_passwords', 'admin_passwords'],
-            'admin_user_session' => ['SELECT session_id FROM admin_user_session', 'admin_user_session'],
+            // `session_id` would be refused first now that bare `session` is protected, and the
+            // message would name `session` rather than the table under test.
+            'admin_user_session' => ['SELECT user_id FROM admin_user_session', 'admin_user_session'],
             'admin_user_expiration' => ['SELECT expires_at FROM admin_user_expiration', 'admin_user_expiration'],
             'oauth_token' => ['SELECT entity_id FROM oauth_token', 'oauth_token'],
             'oauth_consumer' => ['SELECT entity_id FROM oauth_consumer', 'oauth_consumer'],
@@ -674,7 +676,48 @@ class QueryGuardTest extends TestCase
                 'SELECT event_id FROM password_reset_request_event',
                 'password_reset_request_event',
             ],
+            'magebit_mcp_oauth_authorize_handoff' => [
+                'SELECT params_json FROM magebit_mcp_oauth_authorize_handoff',
+                'magebit_mcp_oauth_authorize_handoff',
+            ],
+            'magebit_mcp_audit_log' => [
+                'SELECT tool_name FROM magebit_mcp_audit_log',
+                'magebit_mcp_audit_log',
+            ],
+            'session' => ['SELECT session_data FROM session', 'session'],
+            'cache' => ['SELECT data FROM cache', 'cache'],
+            'admin_adobe_ims_webapi' => [
+                'SELECT id FROM admin_adobe_ims_webapi',
+                'admin_adobe_ims_webapi',
+            ],
         ];
+    }
+
+    /**
+     * The protected set must veto the allowlist for these too, not merely be absent from it.
+     *
+     * @dataProvider deniedTableProvider
+     * @param string $sql
+     * @param string $table
+     * @return void
+     */
+    public function testProtectedTableIsRefusedWhenTheOperatorAllowlistsIt(string $sql, string $table): void
+    {
+        $this->expectException(LocalizedException::class);
+        $this->expectExceptionMessageMatches('/' . preg_quote($table, '/') . '/');
+
+        $this->guard(allowedTables: [$table])->assertReadOnly($sql);
+    }
+
+    /**
+     * @return void
+     */
+    public function testSessionAndCacheProtectionReachesTheirColumnsToo(): void
+    {
+        // Consequence of the wide matcher, recorded so it is a decision rather than a surprise:
+        // any identifier carrying `session` or `cache` as a word run is refused, on any table.
+        $this->assertRejected('SELECT session_id FROM customer_entity', 'session');
+        $this->assertRejected('SELECT cache_id FROM customer_entity', 'cache');
     }
 
     /**
@@ -1012,6 +1055,10 @@ class QueryGuardTest extends TestCase
                 'magebit_mcp_oauth_auth_code', 'magebit_mcp_oauth_refresh_token', 'persistent_session',
                 'password_reset_request_event', 'core_config_data', 'mysql', 'information_schema',
                 'performance_schema', 'sys', 'processlist', 'innodb_trx', 'user_privileges',
+                // Added in Task 7's review round: module-owned or Magento-owned tables holding
+                // security material the MCP surface itself produces or depends on.
+                'magebit_mcp_oauth_authorize_handoff', 'magebit_mcp_audit_log', 'session', 'cache',
+                'admin_adobe_ims_webapi',
             ] as $name
         ) {
             $this->assertContains($name, $protected, sprintf('`%s` is no longer protected by di.xml.', $name));

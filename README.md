@@ -92,7 +92,17 @@ what is executed and echoed back.
 Order of operations per call: the `enabled` flag → `{{table_name}}` substitution → the query
 guard → a session statement timeout and pinned `sql_mode` → execution. A rejection at any step
 comes back as an operator-facing message naming what was refused and, for configuration
-problems, the setting to change.
+problems, the setting to change. Errors raised by the database itself (an unknown column, a
+query the server interrupted on the time limit) are surfaced with the driver's own message, so
+they can be acted on rather than guessed at.
+
+Rows are read one at a time and the read stops as soon as the size limit is reached, so a query
+whose result set is far larger than the response limit is trimmed rather than loaded. The row
+cap bounds the number of rows but never their width, which is why the byte limit exists.
+
+**The statement timeout is mandatory.** It is applied with `max_execution_time` (MySQL 5.7.8+)
+or `max_statement_time` (MariaDB 10.1+), whichever the server supports. If neither is
+available the query is refused rather than run without a time limit.
 
 **Audit.** Every call writes one `magebit_mcp_audit_log` row holding the executed SQL (first
 1000 characters) and the row count. The SQL is stored verbatim and is *not* redacted, so
