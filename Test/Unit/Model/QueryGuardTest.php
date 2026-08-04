@@ -1161,6 +1161,15 @@ class QueryGuardTest extends TestCase
             'lower case clause keywords' => ['select a from unlisted_ledger', 'unlisted_ledger'],
             'explain for connection' => ['EXPLAIN FOR CONNECTION 5', 'for'],
             'quoted describe target' => ['DESCRIBE `unlisted_ledger`', 'unlisted_ledger'],
+            'cte body inside a subquery' => [
+                'SELECT entity_id FROM customer_entity WHERE entity_id IN '
+                . '(WITH c AS (SELECT id FROM unlisted_ledger) SELECT id FROM c)',
+                'unlisted_ledger',
+            ],
+            'explained cte body' => [
+                'EXPLAIN WITH c AS (SELECT id FROM unlisted_ledger) SELECT id FROM c',
+                'unlisted_ledger',
+            ],
             'parenthesised comma list' => [
                 'SELECT a FROM (customer_entity, unlisted_ledger)',
                 'unlisted_ledger',
@@ -1367,6 +1376,13 @@ class QueryGuardTest extends TestCase
             'union branch on an allowlisted table' => [
                 'SELECT entity_id FROM customer_entity UNION ALL SELECT entity_id FROM sales_order',
             ],
+            'explained cte' => [
+                'EXPLAIN WITH c AS (SELECT entity_id FROM customer_entity) SELECT entity_id FROM c',
+            ],
+            'cte inside a subquery' => [
+                'SELECT entity_id FROM customer_entity WHERE entity_id IN '
+                . '(WITH c AS (SELECT entity_id FROM sales_order) SELECT entity_id FROM c)',
+            ],
         ];
     }
 
@@ -1459,6 +1475,138 @@ class QueryGuardTest extends TestCase
     public function testRejectsShowTablesFromAProtectedSchema(): void
     {
         $this->assertRejected('SHOW TABLES FROM information_schema', 'information_schema');
+    }
+
+    // ------------------------------------------------ CTE scoping (fix round 1)
+
+    /**
+     * A non-recursive CTE's own name resolves to the *base table* inside its body, so registering
+     * the name before scanning the body handed over any non-protected table.
+     *
+     * @return array<string, array{string}>
+     */
+    public static function selfReferencingCteProvider(): array
+    {
+        return [
+            'plain' => [
+                'WITH cataloginventory_stock_item AS (SELECT item_id, qty FROM cataloginventory_stock_item) '
+                . 'SELECT item_id, qty FROM cataloginventory_stock_item',
+            ],
+            'quoted name' => [
+                'WITH `cataloginventory_stock_item` AS (SELECT item_id FROM `cataloginventory_stock_item`) '
+                . 'SELECT item_id FROM `cataloginventory_stock_item`',
+            ],
+            'second in the list' => [
+                'WITH a AS (SELECT 1 AS n), cataloginventory_stock_item AS '
+                . '(SELECT item_id FROM cataloginventory_stock_item) SELECT n FROM a',
+            ],
+            'inside a derived table' => [
+                'SELECT d.item_id FROM (WITH cataloginventory_stock_item AS '
+                . '(SELECT item_id FROM cataloginventory_stock_item) SELECT item_id FROM '
+                . 'cataloginventory_stock_item) d',
+            ],
+        ];
+    }
+
+    /**
+     * @dataProvider selfReferencingCteProvider
+     * @param string $sql
+     * @return void
+     */
+    public function testRejectsSelfReferenceInsideANonRecursiveCteBody(string $sql): void
+    {
+        $this->assertRejected($sql, 'cataloginventory_stock_item');
+    }
+
+    public function testRecursiveCteMayStillReferenceItself(): void
+    {
+        // `WITH RECURSIVE x AS (… FROM x)` can never fall through to a base table — the server
+        // answers ERROR 4005 when there is no anchor — so early registration stays for that form.
+        $sql = 'WITH RECURSIVE seq AS (SELECT 1 AS n UNION SELECT n + 1 FROM seq WHERE n < 5) SELECT n FROM seq';
+        $this->assertSame($sql . ' LIMIT 100', $this->guard()->assertReadOnly($sql));
+    }
+
+    /**
+     * Documents the deliberate boundary of the fix, so it is not "tidied up" later: inside a
+     * `WITH RECURSIVE` list the name stays visible in its own body, and that is safe only because
+     * the server refuses an unanchored recursive element. Probed on MariaDB 10.6 for both the first
+     * and a later element of the list — `ERROR 4005: No anchors for recursive WITH element` — so
+     * such a statement can never reach the base table, whatever the guard says.
+     *
+     * @return void
+     */
+    public function testRecursiveListSelfReferenceIsLeftToTheServersAnchorRule(): void
+    {
+        $sql = 'WITH RECURSIVE cataloginventory_stock_item AS '
+            . '(SELECT item_id FROM cataloginventory_stock_item) SELECT item_id FROM cataloginventory_stock_item';
+        $this->assertSame($sql . ' LIMIT 100', $this->guard()->assertReadOnly($sql));
+    }
+
+    public function testPlainCteIsUsableOnceItsBodyIsClosed(): void
+    {
+        $sql = 'WITH c AS (SELECT entity_id FROM customer_entity), d AS (SELECT entity_id FROM c) '
+            . 'SELECT entity_id FROM d';
+        $this->assertSame($sql . ' LIMIT 100', $this->guard()->assertReadOnly($sql));
+    }
+
+    public function testRejectsPhantomCteRegisteredByAWithRollupClause(): void
+    {
+        // `WITH ROLLUP` must not arm CTE registration, or a WINDOW name becomes an exempt table.
+        $this->assertRejected(
+            'SELECT store_id FROM sales_order GROUP BY store_id WITH ROLLUP WINDOW '
+            . 'cataloginventory_stock_item AS (ORDER BY store_id) UNION SELECT item_id FROM '
+            . 'cataloginventory_stock_item',
+            'cataloginventory_stock_item'
+        );
+        $this->assertRejected(
+            'SELECT d.store_id FROM (SELECT store_id FROM sales_order GROUP BY store_id WITH ROLLUP WINDOW '
+            . 'cataloginventory_stock_item AS (ORDER BY store_id)) d, cataloginventory_stock_item',
+            'cataloginventory_stock_item'
+        );
+    }
+
+    public function testAllowsGroupByWithRollup(): void
+    {
+        $sql = 'SELECT store_id, COUNT(*) FROM sales_order GROUP BY store_id WITH ROLLUP';
+        $this->assertSame($sql . ' LIMIT 100', $this->guard()->assertReadOnly($sql));
+    }
+
+    // ------------------------------------------------ FROM inside function arguments
+
+    /**
+     * @return array<string, array{string}>
+     */
+    public static function functionArgumentFromProvider(): array
+    {
+        return [
+            'extract' => ['SELECT EXTRACT(YEAR FROM created_at) FROM sales_order'],
+            'trim' => ["SELECT TRIM(LEADING '0' FROM sku) FROM catalog_product_entity"],
+            'substring' => ['SELECT SUBSTRING(sku FROM 2 FOR 3) FROM catalog_product_entity'],
+            'position' => ["SELECT POSITION('a' IN sku) FROM catalog_product_entity"],
+            'extract in a where clause' => [
+                'SELECT COUNT(*) FROM sales_order WHERE EXTRACT(YEAR FROM created_at) = 2024',
+            ],
+        ];
+    }
+
+    /**
+     * @dataProvider functionArgumentFromProvider
+     * @param string $sql
+     * @return void
+     */
+    public function testFromInsideFunctionArgumentsIsNotATablePosition(string $sql): void
+    {
+        $this->assertSame($sql . ' LIMIT 100', $this->guard()->assertReadOnly($sql));
+    }
+
+    public function testSubqueryInsideFunctionArgumentsIsStillChecked(): void
+    {
+        $this->assertRejected(
+            'SELECT IFNULL((SELECT MAX(id) FROM unlisted_ledger), 0) FROM customer_entity',
+            'unlisted_ledger'
+        );
+        $this->assertRejected('SELECT EXTRACT(YEAR FROM created_at) FROM unlisted_ledger', 'unlisted_ledger');
+        $this->assertRejected('SELECT EXTRACT(YEAR FROM admin_user) FROM sales_order', 'admin_user');
     }
 
     // ------------------------------------------------ structural-keyword exemption

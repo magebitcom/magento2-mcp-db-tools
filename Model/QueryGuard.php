@@ -48,7 +48,8 @@ use Magento\Framework\Exception\LocalizedException;
  *    have to be listed (see {@see assertTablesAreAllowlisted()}), so CTE names and aliases need
  *    no entry, and matching is exact-or-prefixed only — never the wide word-run matcher, which
  *    fails open in the allow direction. Running after layer 5 is what stops an allowlist entry
- *    from re-opening a protected name.
+ *    from re-opening a protected name. The CTE exemption follows the server's own scoping rules
+ *    exactly; anything looser is a read of an unlisted table.
  * 5c. **SHOW form allowlist** — `SHOW` sub-forms that expose tables the allowlist never named
  *    (`TRIGGERS`, `EVENTS`, `TABLE STATUS`, `ENGINE INNODB STATUS`, …) are refused outright;
  *    the forms that do take a table target go through layer 5b like any other table position.
@@ -754,10 +755,13 @@ class QueryGuard
      * into the parentheses.
      *
      * Everything else is left alone, which is what keeps table aliases, derived-table aliases and
-     * column aliases out of the allowlist. CTE names are exempt as well, but only inside the scope
-     * that defines them: a `WITH` inside a derived table is scoped to that derived table, so
-     * remembering CTE names statement-wide would let a nested `WITH secret AS (…)` exempt a
-     * reference to the real `secret` table outside it.
+     * column aliases out of the allowlist. CTE names are exempt as well, but only where the server
+     * agrees they are in scope — see {@see TableScanScope}: exempt within the defining scope only
+     * (a `WITH` inside a derived table is scoped to that derived table), and for a plain `WITH`
+     * only from the close of its own body, because inside that body the name still resolves to the
+     * base table. Registration is armed exclusively by a positional `WITH` clause opener
+     * ({@see opensCteList()}), so neither `GROUP BY … WITH ROLLUP` nor a `WINDOW <name> AS (…)`
+     * clause can smuggle a name into the exempt set.
      *
      * @param non-empty-list<SqlToken> $tokens
      * @param string $leadingKeyword
@@ -779,17 +783,31 @@ class QueryGuard
                     // A parenthesis standing in a table position is either a derived table or a
                     // parenthesised table reference — MariaDB reads `FROM (t)` as a read of `t` —
                     // so the expectation has to travel inside.
-                    $scopes[] = new TableScanScope($scope->expectTable, $scope->expectTable);
+                    $scopes[] = new TableScanScope(
+                        $scope->expectTable,
+                        $scope->expectTable,
+                        $this->opensFunctionArguments($tokens, $index)
+                    );
                     $scope->expectTable = false;
                     continue;
                 }
                 if ($token['value'] === ')') {
                     if (count($scopes) > 1) {
                         array_pop($scopes);
+                        // A CTE body just closed: its name (if deferred) comes into scope now.
+                        $scopes[count($scopes) - 1]->closeCommonTableExpressionBody();
                     }
                     continue;
                 }
-                $scope->expectTable = $token['value'] === ',' && $scope->inTableList;
+                if ($token['value'] === ',') {
+                    $scope->expectTable = $scope->inTableList;
+                    if ($scope->continuesCteList) {
+                        $scope->expectCteName = true;
+                        $scope->continuesCteList = false;
+                    }
+                    continue;
+                }
+                $scope->expectTable = false;
                 continue;
             }
 
@@ -810,9 +828,14 @@ class QueryGuard
             }
 
             // A quoted CTE name is still a CTE name: what makes the exemption safe is the WITH
-            // position and the scope, not the quoting.
-            if ($scope->inWithList && $this->definesCommonTableExpression($tokens, $index)) {
-                $scope->defineCommonTableExpression($token['value']);
+            // position, the scope and the registration timing, not the quoting.
+            if ($scope->expectCteName && $this->definesCommonTableExpression($tokens, $index)) {
+                if ($scope->recursiveCteList) {
+                    $scope->defineCommonTableExpression($token['value']);
+                } else {
+                    $scope->deferCommonTableExpression($token['value']);
+                }
+                $scope->expectCteName = false;
                 continue;
             }
 
@@ -822,11 +845,16 @@ class QueryGuard
 
             switch ($keyword) {
                 case 'WITH':
-                    $scope->inWithList = true;
+                    // Only a real CTE-list opener arms registration. `GROUP BY … WITH ROLLUP` is
+                    // the same token in a completely different role.
+                    if ($this->opensCteList($tokens, $index, $leadingKeyword)) {
+                        $scope->expectCteName = true;
+                        $scope->recursiveCteList = $this->isRecursiveCteList($tokens, $index);
+                    }
                     break;
                 case 'SELECT':
                     // The statement's own query begins: the WITH list, if any, is over.
-                    $scope->inWithList = false;
+                    $scope->endCteList();
                     $scope->inTableList = false;
                     break;
                 case 'DESCRIBE':
@@ -837,6 +865,16 @@ class QueryGuard
                     }
                     break;
                 case 'FROM':
+                    // Inside a function's argument list `FROM` separates arguments — it is how
+                    // `EXTRACT(YEAR FROM col)` and `TRIM(LEADING '0' FROM col)` are written — and
+                    // names a column, never a table. A subquery there has its own parentheses, so
+                    // it lands in a scope of its own and is still checked.
+                    if (!$scope->inFunctionArguments) {
+                        $scope->expectTable = true;
+                        $scope->inTableList = true;
+                    }
+                    $scope->endCteList();
+                    break;
                 case 'JOIN':
                     $scope->expectTable = true;
                     $scope->inTableList = true;
@@ -849,8 +887,9 @@ class QueryGuard
                     }
                     break;
                 case 'IN':
-                    // `SHOW COLUMNS IN <table>`; elsewhere `IN` introduces a value list.
-                    $scope->expectTable = $isShow;
+                    // `SHOW COLUMNS IN <table>`; elsewhere `IN` introduces a value list, and inside
+                    // function arguments it separates them (`POSITION('a' IN col)`).
+                    $scope->expectTable = $isShow && !$scope->inFunctionArguments;
                     break;
                 default:
                     if (in_array($keyword, self::TABLE_LIST_TERMINATORS, true)) {
@@ -882,10 +921,82 @@ class QueryGuard
     }
 
     /**
-     * Whether the word at $index is a CTE name — `<name> AS (`. Only ever consulted inside a
-     * `WITH` list, so a window definition (`WINDOW w AS (…)`) is not mistaken for one: window
-     * names are not table names, and a statement-wide `x AS (` rule would exempt whatever an
-     * attacker put there from the allowlist.
+     * Whether the `(` at $index opens a function call's argument list rather than a subquery, a
+     * grouped expression or a parenthesised table reference. A word directly before `(` has already
+     * been through layer 4b, so it is either an allowed built-in function or one of the structural
+     * keywords — which makes "a non-structural word precedes it" an exact test for a function call.
+     *
+     * @param list<SqlToken> $tokens
+     * @param int $index Index of the `(`.
+     * @return bool
+     */
+    private function opensFunctionArguments(array $tokens, int $index): bool
+    {
+        $previous = $tokens[$index - 1] ?? null;
+
+        if ($previous === null || $previous['type'] !== self::TYPE_WORD) {
+            return false;
+        }
+
+        return $previous['quoted']
+            || !in_array(strtoupper($previous['value']), self::STRUCTURAL_KEYWORDS, true);
+    }
+
+    /**
+     * Whether the `WITH` at $index opens a CTE list. Positional on purpose: `WITH` also introduces
+     * `GROUP BY … WITH ROLLUP`, and treating that as a CTE list let a following `WINDOW <name> AS
+     * (…)` register `<name>` as an exempt phantom table. A CTE list can only start a statement, sit
+     * right after `(`, or follow `EXPLAIN`; and it must be followed by `RECURSIVE` or by a real
+     * `<name> AS (` definition.
+     *
+     * @param list<SqlToken> $tokens
+     * @param int $index
+     * @param string $leadingKeyword
+     * @return bool
+     */
+    private function opensCteList(array $tokens, int $index, string $leadingKeyword): bool
+    {
+        $previous = $tokens[$index - 1] ?? null;
+        $positional = $index === 0
+            || ($previous !== null && $previous['type'] === self::TYPE_PUNCT && $previous['value'] === '(')
+            || ($index === 1 && $leadingKeyword === 'EXPLAIN');
+
+        if (!$positional) {
+            return false;
+        }
+
+        $next = $tokens[$index + 1] ?? null;
+        if ($next === null || $next['type'] !== self::TYPE_WORD) {
+            return false;
+        }
+        if (!$next['quoted'] && strtoupper($next['value']) === 'ROLLUP') {
+            return false;
+        }
+
+        return $this->isRecursiveCteList($tokens, $index)
+            ? $this->definesCommonTableExpression($tokens, $index + 2)
+            : $this->definesCommonTableExpression($tokens, $index + 1);
+    }
+
+    /**
+     * @param list<SqlToken> $tokens
+     * @param int $index Index of the `WITH` token.
+     * @return bool
+     */
+    private function isRecursiveCteList(array $tokens, int $index): bool
+    {
+        $next = $tokens[$index + 1] ?? null;
+
+        return $next !== null
+            && $next['type'] === self::TYPE_WORD
+            && !$next['quoted']
+            && strtoupper($next['value']) === 'RECURSIVE';
+    }
+
+    /**
+     * Whether the word at $index is a CTE name — `<name> AS (`. Only ever consulted where a CTE
+     * name is expected (right after a `WITH` opener or a comma continuing its list), so a window
+     * definition (`WINDOW w AS (…)`) can never be mistaken for one.
      *
      * @param list<SqlToken> $tokens
      * @param int $index
