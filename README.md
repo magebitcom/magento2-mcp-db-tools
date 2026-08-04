@@ -56,6 +56,50 @@ Stores → Configuration → Magebit → MCP Server → **MCP Database Reader**
 | Allowed Tables | *(empty)* | **The only tables the tool may read**, one per line; `#` lines ignored. Empty refuses every query. |
 | Additional Denied Tables | *(empty)* | Extra tables to protect on top of the allowlist, one per line. |
 
+## The `db.query` tool
+
+| | |
+|---|---|
+| Tool name | `db.query` |
+| ACL | `Magebit_McpDbTools::tool_db_query` |
+| Write mode | read |
+
+**Arguments**
+
+| Argument | Type | Required | Notes |
+|---|---|---|---|
+| `query` | string | yes | 6–8000 characters. One read-only statement. `{{table_name}}` is replaced with the real, prefixed table name. |
+| `limit` | integer | no | 1 … **Maximum Row Limit**. Used only when the statement carries no `LIMIT` of its own. |
+
+**Response**
+
+```json
+{
+  "columns": ["entity_id", "status"],
+  "rows": [{"entity_id": "1", "status": "complete"}],
+  "row_count": 1,
+  "limit_applied": 100,
+  "truncated": false,
+  "executed_sql": "SELECT entity_id, status FROM sales_order LIMIT 100"
+}
+```
+
+`truncated` is true when the row cap was reached or when the response was trimmed to stay
+under its ~1 MiB size limit. `executed_sql` is the exact statement that ran — the guard
+normalises whitespace, strips comments and appends the `LIMIT`, and that normalised form is
+what is executed and echoed back.
+
+Order of operations per call: the `enabled` flag → `{{table_name}}` substitution → the query
+guard → a session statement timeout and pinned `sql_mode` → execution. A rejection at any step
+comes back as an operator-facing message naming what was refused and, for configuration
+problems, the setting to change.
+
+**Audit.** Every call writes one `magebit_mcp_audit_log` row holding the executed SQL (first
+1000 characters) and the row count. The SQL is stored verbatim and is *not* redacted, so
+literals inside a query — `WHERE email = '…'` — are retained. That is intentional for an
+audit trail of raw SQL, but it means the audit table inherits the sensitivity of the queries
+that are run.
+
 ## Security documentation
 
 Full threat model, the protected set, the SQL grammar that is accepted, and
