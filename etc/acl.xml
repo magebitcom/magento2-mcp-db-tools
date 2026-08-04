@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="urn:magento:framework:Acl/etc/acl.xsd">
+    <acl>
+        <resources>
+            <resource id="Magento_Backend::admin">
+                <resource id="Magento_Backend::system">
+                    <resource id="Magebit_McpDbTools::mcp" title="MCP Database Reader" sortOrder="520">
+
+                        <!-- Read-only SQL. Grant to trusted operators only. -->
+                        <resource id="Magebit_McpDbTools::tool_db_query"
+                                  title="Tool: Run Read-Only SQL Query" sortOrder="10"/>
+
+                    </resource>
+                </resource>
+            </resource>
+        </resources>
+    </acl>
+</config>

@@ -1,0 +1,19 @@
+{
+    "name": "magebitcom/magento2-mcp-db-tools",
+    "description": "Read-only SQL MCP tool for Magebit_Mcp — exposes a guarded, SELECT-only query tool over the Magento database. Disabled by default; enable only for trusted operators.",
+    "type": "magento2-module",
+    "license": "MIT",
+    "require": {
+        "php": ">=8.1",
+        "magento/framework": "^103.0",
+        "magebitcom/magento2-mcp-module": "^1.1"
+    },
+    "autoload": {
+        "files": [
+            "registration.php"
+        ],
+        "psr-4": {
+            "Magebit\\McpDbTools\\": ""
+        }
+    }
+}

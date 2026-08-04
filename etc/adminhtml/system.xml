@@ -1,0 +1,72 @@
+<?xml version="1.0"?>
+<config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="urn:magento:module:Magento_Config:etc/system_file.xsd">
+    <system>
+        <!-- Extends the `magebit_mcp` section shipped by Magebit_Mcp (resource Magebit_Mcp::config). -->
+        <section id="magebit_mcp">
+            <group id="db_tools" translate="label comment" type="text" sortOrder="70"
+                   showInDefault="1" showInWebsite="0" showInStore="0">
+                <label>MCP Database Reader</label>
+                <comment><![CDATA[<p>Settings for the optional <code>db.query</code> tool — read-only SQL
+                against this store's database. <strong>This is the highest-risk tool in the MCP family.</strong>
+                It is off by default, gated by its own ACL resource
+                (<em>Tool: Run Read-Only SQL Query</em>), and rejects anything that is not a single
+                <code>SELECT</code>.</p>
+                <p>Even so, a read-only query can still expose customer PII, order history, admin
+                account rows, and configuration values. Treat "who may enable this" and "which token
+                holds the ACL" as security decisions, not convenience ones.</p>]]></comment>
+                <field id="enabled" translate="label comment" type="select" sortOrder="10"
+                       showInDefault="1" showInWebsite="0" showInStore="0">
+                    <label>Enable Read-Only SQL Tool</label>
+                    <source_model>Magento\Config\Model\Config\Source\Yesno</source_model>
+                    <comment><![CDATA[<strong>Default: No.</strong> Setting this to <strong>Yes</strong>
+                    grants read access to <em>most of this store's database</em> to any MCP token whose
+                    admin role holds the <em>Tool: Run Read-Only SQL Query</em> ACL resource — customer
+                    records, addresses, order and payment metadata, quotes, and configuration values
+                    included. Queries are restricted to a single read-only <code>SELECT</code> and a
+                    deny-list blocks the most sensitive tables, but everything else is readable.
+                    Only enable this if you intend to give those token holders that level of access,
+                    and keep the ACL resource off every role that does not need it.]]></comment>
+                </field>
+                <field id="default_rows" translate="label comment" type="text" sortOrder="20"
+                       showInDefault="1" showInWebsite="0" showInStore="0">
+                    <label>Default Row Limit</label>
+                    <validate>validate-greater-than-zero validate-digits</validate>
+                    <depends><field id="enabled">1</field></depends>
+                    <comment><![CDATA[Row cap applied when a query does not ask for one. Keeping this
+                    small limits how much data a single careless or hostile call can extract, and how
+                    much of it lands in the MCP audit log. Default <code>100</code>.]]></comment>
+                </field>
+                <field id="row_limit_ceiling" translate="label comment" type="text" sortOrder="30"
+                       showInDefault="1" showInWebsite="0" showInStore="0">
+                    <label>Maximum Row Limit</label>
+                    <validate>validate-greater-than-zero validate-digits</validate>
+                    <depends><field id="enabled">1</field></depends>
+                    <comment><![CDATA[Hard ceiling a caller can never exceed, however large a limit it
+                    requests. This is the bulk-exfiltration brake — raising it directly raises how many
+                    rows one call can pull out of the store. Default <code>1000</code>.]]></comment>
+                </field>
+                <field id="statement_timeout_seconds" translate="label comment" type="text" sortOrder="40"
+                       showInDefault="1" showInWebsite="0" showInStore="0">
+                    <label>Statement Timeout (seconds)</label>
+                    <validate>validate-greater-than-zero validate-digits</validate>
+                    <depends><field id="enabled">1</field></depends>
+                    <comment><![CDATA[Server-side time budget per query. This is the denial-of-service
+                    brake: without it a single unindexed join can pin a database thread and starve the
+                    storefront. Raise it only if you accept that risk. Default <code>10</code>.]]></comment>
+                </field>
+                <field id="extra_denied_tables" translate="label comment" type="textarea" sortOrder="50"
+                       showInDefault="1" showInWebsite="0" showInStore="0">
+                    <label>Additional Denied Tables</label>
+                    <depends><field id="enabled">1</field></depends>
+                    <comment><![CDATA[<p>One table name per line, added to the module's built-in
+                    deny-list. Blank lines and lines starting with <code>#</code> are ignored.</p>
+                    <p>Use this to protect data the built-in list cannot know about — custom tables
+                    holding credentials, API keys, tokens, or regulated customer data. Entries here
+                    only ever <em>add</em> restrictions; they cannot re-open a table the module already
+                    denies.]]></comment>
+                </field>
+            </group>
+        </section>
+    </system>
+</config>

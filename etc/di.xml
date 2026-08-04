@@ -1,0 +1,16 @@
+<?xml version="1.0"?>
+<config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="urn:magento:framework:ObjectManager/etc/config.xsd">
+
+    <!--
+        Tool registration for this module. The `db.query` item is added in the task that
+        implements the tool class; the array is intentionally empty until then so the
+        module stays inert if it is installed ahead of the tool implementation.
+    -->
+    <type name="Magebit\Mcp\Model\Tool\ToolRegistry">
+        <arguments>
+            <argument name="tools" xsi:type="array"/>
+        </arguments>
+    </type>
+
+</config>

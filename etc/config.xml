@@ -1,0 +1,17 @@
+<?xml version="1.0"?>
+<config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="urn:magento:module:Magento_Store:etc/config.xsd">
+    <default>
+        <magebit_mcp>
+            <db_tools>
+                <!-- Off by default: installing this module must never widen the attack surface on its own. -->
+                <enabled>0</enabled>
+                <default_rows>100</default_rows>
+                <row_limit_ceiling>1000</row_limit_ceiling>
+                <statement_timeout_seconds>10</statement_timeout_seconds>
+                <extra_denied_tables># One table name per line. Lines starting with # are ignored.
+# Listed tables are added to the module's built-in deny-list and can never be read.</extra_denied_tables>
+            </db_tools>
+        </magebit_mcp>
+    </default>
+</config>
