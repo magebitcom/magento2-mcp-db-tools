@@ -145,6 +145,7 @@ contiguous run of underscore-delimited words inside a longer identifier, so wrap
 | `persistent_session` | "Remember me" session keys |
 | `admin_adobe_ims_webapi` | Adobe IMS API credentials |
 | `password_reset_request_event` | Password-reset throttling records |
+| `tfa_user_config` | Admin two-factor secrets — `encoded_config` holds the TOTP shared secret |
 | `core_config_data` | Encrypted payment-gateway credentials and API keys |
 
 Matched **exactly, or behind the table prefix** (`session`, `m2_session`) and nothing wider,
@@ -200,18 +201,37 @@ Independent of table resolution, because no table allowlist can protect
 allowlist contains. A query naming any of these anywhere (select list, `WHERE`, `JOIN`, alias) is
 refused:
 
-`password_hash`, `password`, `rp_token`, `rp_token_created_at`, `x_forwarded_for`, `token`,
-`secret`, `api_key`, `authentication_string`, `session_id`, `session_data`, `cc_number_enc`,
-`cc_cid_enc`, `cc_owner`, `cc_last4`
+| Term | Catches |
+|---|---|
+| `password_hash`, `password` | Customer and admin password material |
+| `rp_token`, `rp_token_created_at` | Password-reset tokens |
+| `token`, `secret`, `api_key`, `authentication_string` | Credential columns generally, including third-party ones |
+| `session_id`, `session_data` | Session hijacking material on any table, `customer_visitor.session_id` included |
+| `cc` | **Every `cc_*` column** on `sales_order_payment` and `quote_payment` — 30 of them, not just the encrypted ones. Last four plus brand plus expiry, joined to a cardholder name from `sales_order`, is PCI cardholder data even though no single column reads like a secret. |
+| `cc_number_enc`, `cc_cid_enc`, `cc_owner` | Subsets of the rule above, kept so the rejection message names the most sensitive columns precisely |
+| `confirmation`, `subscriber_confirm_code` | Account-activation keys. `customer_entity.confirmation` is the value `/customer/account/confirm` accepts before logging the customer in — possession of it *is* a login, not a status flag. |
+| `link_hash` | `downloadable_link_purchased_item` — the capability token in a shareable download URL |
+| `additional_information` | Serialized gateway payloads on `sales_order_payment`, `quote_payment`, `sales_payment_transaction` and `paypal_payment_transaction`. Their keys are string content no identifier scan can see; `raw_details_info` alone can carry a masked PAN, expiry, BIN and AVS/CVV results. |
+| `x_forwarded_for` | Customer IP addresses on `sales_order` |
 
 Matching is wide and deliberately so: `token` also refuses `access_token`, `token_hash` and
-`customer_api_key`. Known collateral damage, all fail-closed:
+`customer_api_key`, and the bare `cc` term expands to every `cc_*` column. Known collateral damage,
+all fail-closed:
 
 - Any column carrying a protected table's word run — `admin_user_id`, so you cannot join on the
   audit log's FK column.
-- Any *table* whose name contains a denied column word — a project table called `token_registry` or
-  `secret_ledger` is unreachable.
+- Any *table* whose name contains a denied column word — a project table called `token_registry`,
+  `secret_ledger` or (with the `cc` family rule) one whose name has `cc` as a word is unreachable.
+  There is no such table in Magento core.
 - `session_id` / `session_data` on any table, so `customer_visitor.session_id` cannot be read.
+- `confirmation` on any table, so "how many customers have not confirmed their address yet?" cannot
+  be answered through this tool. A bearer credential is worth more than that query.
+- `additional_information` everywhere, including the non-payment uses a third-party module may have
+  for the same column name.
+
+Every term is pinned by a test that executes the matcher against the **real column spelling** it
+exists to catch, and a term with no such spelling fails the suite — a term that matches nothing
+reads as protection while protecting nothing, which is a bug this list has had before.
 
 ## Choosing an allowlist
 
@@ -251,6 +271,11 @@ operators most often want to add next, are personal data:
 | `customer_address_entity` | Home addresses and telephone numbers |
 | `quote`, `quote_address`, `quote_item` | The same, for abandoned carts — often for people who never completed an order |
 | `newsletter_subscriber` | E-mail addresses and consent state |
+
+`sales_order_payment` and `quote_payment` are a special case: you can list them, and `method`,
+`amount_*` and the FK columns come back, but every `cc_*` column and `additional_information` are
+refused, so the payment-analytics questions people usually want them for are mostly unanswerable.
+That is deliberate.
 
 Listing any of them means the token holder can read that data, in bulk, up to the row cap, on any
 query shape the guard accepts. Column names carrying secrets are still refused, but a customer's

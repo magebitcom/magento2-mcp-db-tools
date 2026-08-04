@@ -40,6 +40,9 @@ class QueryGuardTest extends TestCase
         'sales_order_payment',
         'quote_payment',
         'some_table',
+        'newsletter_subscriber',
+        'downloadable_link_purchased_item',
+        'sales_payment_transaction',
         't',
         't2',
     ];
@@ -606,7 +609,9 @@ class QueryGuardTest extends TestCase
             'dates' => ["SELECT DATE_FORMAT(created_at, '%Y-%m') FROM sales_order"],
             'cast with precision' => ['SELECT CAST(grand_total AS DECIMAL(12,4)) FROM sales_order'],
             'control flow' => ["SELECT IFNULL(coupon_code, '-'), IF(state = 'new', 1, 0) FROM sales_order"],
-            'json accessor' => ["SELECT JSON_EXTRACT(additional_information, '$.x') FROM sales_order_payment"],
+            // `additional_information` used to stand here; it is a denied column now, so the JSON
+            // accessor is exercised on an ordinary column instead.
+            'json accessor' => ["SELECT JSON_EXTRACT(extra_data, '$.x') FROM some_table"],
             'window function' => [
                 'SELECT ROW_NUMBER() OVER (PARTITION BY store_id ORDER BY entity_id) FROM sales_order',
             ],
@@ -694,6 +699,9 @@ class QueryGuardTest extends TestCase
                 'SELECT id FROM admin_adobe_ims_webapi',
                 'admin_adobe_ims_webapi',
             ],
+            // Magento_TwoFactorAuth ships in 2.4 core and is enabled by default: `encoded_config`
+            // holds the admin TOTP shared secret.
+            'tfa_user_config' => ['SELECT id FROM tfa_user_config', 'tfa_user_config'],
         ];
     }
 
@@ -911,11 +919,98 @@ class QueryGuardTest extends TestCase
                 "SELECT entity_id FROM customer_entity WHERE password_hash LIKE 'a%'",
                 'password_hash',
             ],
-            'cc_last4' => ['SELECT cc_last4 FROM sales_order_payment', 'cc_last4'],
             'cc_owner' => ['SELECT cc_owner FROM sales_order_payment', 'cc_owner'],
             'cc_number_enc' => ['SELECT cc_number_enc FROM sales_order_payment', 'cc_number_enc'],
             'cc_cid_enc' => ['SELECT cc_cid_enc FROM quote_payment', 'cc_cid_enc'],
+            // The whole `cc_*` family, which is what the README and the tool description promise.
+            // `cc_last_4` is the real column name — the enumeration used to spell it `cc_last4`,
+            // which the word-run matcher can never match, so the column was readable.
+            'cc_last_4' => ['SELECT cc_last_4 FROM sales_order_payment', 'cc'],
+            'cc_type' => ['SELECT cc_type FROM sales_order_payment', 'cc'],
+            'cc_exp_month' => ['SELECT cc_exp_month FROM sales_order_payment', 'cc'],
+            'cc_exp_year' => ['SELECT cc_exp_year FROM quote_payment', 'cc'],
+            'cc_trans_id' => ['SELECT cc_trans_id FROM sales_order_payment', 'cc'],
+            'cc_avs_status' => ['SELECT cc_avs_status FROM sales_order_payment', 'cc'],
+            'cc_ss_owner' => ['SELECT cc_ss_owner FROM quote_payment', 'cc'],
+            'cc_debug_response_body' => ['SELECT cc_debug_response_body FROM sales_order_payment', 'cc'],
+            // Bearer credentials: possession of the value is possession of the account.
+            'confirmation' => ['SELECT confirmation FROM customer_entity', 'confirmation'],
+            'subscriber_confirm_code' => [
+                'SELECT subscriber_confirm_code FROM newsletter_subscriber',
+                'subscriber_confirm_code',
+            ],
+            'link_hash' => [
+                'SELECT link_hash FROM downloadable_link_purchased_item',
+                'link_hash',
+            ],
+            // Serialized gateway payloads: the keys inside are string content the scan cannot see.
+            'additional_information' => [
+                'SELECT additional_information FROM sales_payment_transaction',
+                'additional_information',
+            ],
         ];
+    }
+
+    /**
+     * The real column spelling each denied term exists to catch, sourced from the Magento schema
+     * (or from `mysql.user` for `authentication_string`). Adding a term without a real spelling
+     * here fails {@see testEveryDeniedColumnTermMatchesItsRealColumn}, which is what turns a
+     * mis-spelled term — the `cc_last4` / `cc_last_4` bug — into a failing test rather than a
+     * column that is silently readable.
+     *
+     * @var array<string, string>
+     */
+    private const DENIED_COLUMN_SPELLINGS = [
+        'password_hash' => 'password_hash',                     // customer_entity, admin_passwords
+        'password' => 'password',                               // admin_user
+        'rp_token' => 'rp_token',                               // customer_entity, admin_user
+        'rp_token_created_at' => 'rp_token_created_at',         // customer_entity, admin_user
+        'x_forwarded_for' => 'x_forwarded_for',                 // sales_order
+        'token' => 'access_token',                              // admin_adobe_ims_webapi
+        'secret' => 'client_secret_hash',                       // magebit_mcp_oauth_client
+        'api_key' => 'api_key',                                 // third-party payment/shipping modules
+        'authentication_string' => 'authentication_string',     // mysql.user
+        'session_id' => 'session_id',                           // customer_visitor, admin_user_session
+        'session_data' => 'session_data',                       // session
+        'cc' => 'cc_last_4',                                    // sales_order_payment, quote_payment
+        'cc_number_enc' => 'cc_number_enc',                     // sales_order_payment, quote_payment
+        'cc_cid_enc' => 'cc_cid_enc',                           // quote_payment
+        'cc_owner' => 'cc_owner',                               // sales_order_payment, quote_payment
+        'confirmation' => 'confirmation',                       // customer_entity, customer_grid_flat
+        'subscriber_confirm_code' => 'subscriber_confirm_code', // newsletter_subscriber
+        'link_hash' => 'link_hash',                             // downloadable_link_purchased_item
+        'additional_information' => 'additional_information',   // sales_order_payment + 3 more
+    ];
+
+    /**
+     * The regression test for the `cc_last4` class of bug: a term that matches no real column
+     * protects nothing while reading as protection. Executes the matcher rather than inspecting
+     * the array, and requires the term itself to be the verdict, so a term that only matches
+     * because a *different* term covers the same spelling is not counted as live.
+     *
+     * @return void
+     */
+    public function testEveryDeniedColumnTermMatchesItsRealColumn(): void
+    {
+        $denyList = new ColumnDenyList(new IdentifierMatcher($this->createMock(DeploymentConfig::class)));
+
+        foreach ($denyList->getDeniedColumns() as $term) {
+            $spelling = self::DENIED_COLUMN_SPELLINGS[$term] ?? null;
+            $this->assertNotNull(
+                $spelling,
+                sprintf(
+                    'The denied column term `%s` has no real column spelling in '
+                    . 'DENIED_COLUMN_SPELLINGS. Add the schema column it exists to catch.',
+                    $term
+                )
+            );
+
+            $this->assertSame(
+                $term,
+                $denyList->findDeniedColumn($spelling),
+                sprintf('The term `%s` does not match the real column `%s`.', $term, $spelling)
+            );
+        }
     }
 
     /**
@@ -1141,6 +1236,8 @@ class QueryGuardTest extends TestCase
                 // security material the MCP surface itself produces or depends on.
                 'magebit_mcp_oauth_authorize_handoff', 'magebit_mcp_audit_log', 'session', 'cache',
                 'cache_tag', 'admin_adobe_ims_webapi',
+                // Added in the whole-module security review: admin 2FA shared secrets.
+                'tfa_user_config',
             ] as $name
         ) {
             $this->assertContains($name, $protected, sprintf('`%s` is no longer protected by di.xml.', $name));
@@ -1564,7 +1661,43 @@ class QueryGuardTest extends TestCase
         // A table allowlist cannot protect a secret column on a table any useful list contains.
         $this->assertRejected('SELECT password_hash FROM customer_entity', 'password_hash');
         $this->assertRejected('SELECT rp_token FROM customer_entity', 'rp_token');
-        $this->assertRejected('SELECT cc_last4 FROM sales_order_payment', 'cc_last4');
+        $this->assertRejected('SELECT cc_last_4 FROM sales_order_payment', 'cc');
+        $this->assertRejected('SELECT confirmation FROM customer_entity', 'confirmation');
+    }
+
+    /**
+     * The security review's cardholder-data exploit: with `sales_order_payment` allowlisted — a
+     * routine addition for order analytics — this returned last four, brand and full expiry in
+     * bulk, joinable to the cardholder's name and address on `sales_order`.
+     *
+     * @return void
+     */
+    public function testRejectsBulkCardholderDataHarvest(): void
+    {
+        $this->assertRejected(
+            'SELECT parent_id, cc_last_4, cc_type, cc_exp_month, cc_exp_year '
+            . 'FROM sales_order_payment LIMIT 1000',
+            'cc'
+        );
+        $this->assertRejected(
+            'SELECT p.cc_last_4, o.customer_firstname FROM sales_order_payment p '
+            . 'JOIN sales_order o ON o.entity_id = p.parent_id',
+            'cc'
+        );
+    }
+
+    /**
+     * The account-takeover exploit: `customer_entity.confirmation` is the activation key
+     * `/customer/account/confirm` accepts, so possession of the value is a login.
+     *
+     * @return void
+     */
+    public function testRejectsPendingRegistrationConfirmationKeys(): void
+    {
+        $this->assertRejected(
+            'SELECT entity_id, email, confirmation FROM customer_entity WHERE confirmation IS NOT NULL',
+            'confirmation'
+        );
     }
 
     // ------------------------------------------------ SHOW forms
