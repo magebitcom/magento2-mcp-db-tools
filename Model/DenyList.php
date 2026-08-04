@@ -51,14 +51,16 @@ class DenyList
     ];
 
     /**
-     * Server-owned identifiers. `mysql.user` holds password hashes and `processlist`
-     * leaks the SQL text other sessions are running.
+     * Server-owned identifiers. `mysql.user` holds password hashes; `processlist` and
+     * `innodb_trx` both expose the SQL text — literals included — of other sessions.
      */
     private const DENIED_EXACT_IDENTIFIERS = [
         'mysql',
         'performance_schema',
         'sys',
         'processlist',
+        'innodb_trx',
+        'user_privileges',
     ];
 
     /**
@@ -75,6 +77,11 @@ class DenyList
         'secret',
         'api_key',
         'authentication_string',
+        // Payment-card material on sales_order_payment / quote_payment.
+        'cc_number_enc',
+        'cc_cid_enc',
+        'cc_owner',
+        'cc_last4',
     ];
 
     /**
@@ -160,6 +167,9 @@ class DenyList
 
     /**
      * Whether $needle appears as a contiguous run of whole words inside $haystack.
+     * Words are underscore-delimited, so a camelCase spelling of a protected name
+     * (`adminUser`) is not recognised — irrelevant for MySQL table/column names, which
+     * are snake_case throughout Magento.
      *
      * @param list<string> $haystack
      * @param list<string> $needle

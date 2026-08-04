@@ -21,7 +21,10 @@ use Magento\Framework\Exception\LocalizedException;
  *    (words, string literals, numbers, punctuation) while comments are replaced by a single
  *    space and whitespace runs collapsed. Analysis happens on the token stream, never on the
  *    raw text, so a keyword inside a string literal cannot trip a scanner and a `--` inside a
- *    literal cannot truncate one. MySQL executable comments (`/*!`, `/*+`) are rejected
+ *    literal cannot truncate one. Literal boundaries must agree with the server's exactly,
+ *    which is why `\` inside a literal is refused: whether it escapes depends on sql_mode, and
+ *    a disagreement lets an attacker hide a whole clause inside what we think is one string.
+ *    MySQL executable comments (`/*!`, `/*+`) are rejected
  *    outright: they hide syntax from naive scanners and have no legitimate place in an
  *    operator's read query.
  * 2. **Single statement.** A `;` anywhere but at the very end is refused, which is what stops
@@ -33,6 +36,9 @@ use Magento\Framework\Exception\LocalizedException;
  *    every mutating statement keyword plus the exfiltration/DoS forms (`INTO OUTFILE`,
  *    `LOAD_FILE`, `SLEEP`, `BENCHMARK`, `GET_LOCK`, …). Session and system variables (`@`,
  *    `@@`) are refused too, which covers `SELECT … INTO @var` and `SELECT @x := …`.
+ * 4b. **Function allowlist.** Every `name(` must be a built-in read-only function. A deny-list
+ *    cannot stop a stored function or UDF that mutates data, because the operator chooses the
+ *    name; only an allowlist can.
  * 5. **Table deny-list** — see {@see DenyList}. Scanned over every identifier in the
  *    statement, including subqueries and joins; no clause-aware parsing is attempted.
  * 6. **Column deny-list** — same scan, secret-bearing column names.
@@ -44,7 +50,9 @@ use Magento\Framework\Exception\LocalizedException;
  *
  * Layers 7 and 8 are skipped for SHOW/DESCRIBE/DESC/EXPLAIN, which return no table rows.
  *
- * @phpstan-type SqlToken array{type: string, value: string}
+ * @phpstan-type SqlToken array{type: string, value: string, quoted: bool}
+ *   `quoted` marks a backtick-quoted identifier — always an identifier or function name to
+ *   MySQL, never a bare keyword, so it never earns the structural exemption in layer 4b.
  */
 class QueryGuard
 {
@@ -72,11 +80,81 @@ class QueryGuard
      */
     private const DENIED_KEYWORDS = [
         'INSERT', 'UPDATE', 'DELETE', 'REPLACE', 'MERGE', 'DROP', 'ALTER', 'CREATE', 'TRUNCATE', 'RENAME',
-        'GRANT', 'GRANTS', 'REVOKE', 'COMMIT', 'ROLLBACK', 'SAVEPOINT', 'LOCK', 'UNLOCK', 'CALL', 'DO',
-        'HANDLER', 'LOAD', 'PREPARE', 'EXECUTE', 'DEALLOCATE', 'SET', 'FLUSH', 'RESET', 'SHUTDOWN', 'KILL',
-        'INSTALL', 'UNINSTALL', 'BINLOG', 'PURGE', 'OPTIMIZE', 'REPAIR', 'ANALYZE', 'ANALYSE', 'CHECKSUM',
-        'PROCEDURE', 'INTO', 'OUTFILE', 'DUMPFILE', 'LOAD_FILE', 'SLEEP', 'BENCHMARK', 'GET_LOCK',
-        'RELEASE_LOCK', 'IS_USED_LOCK', 'IS_FREE_LOCK', 'MASTER_POS_WAIT', 'SYS_EXEC', 'SYS_EVAL',
+        'GRANT', 'GRANTS', 'REVOKE', 'COMMIT', 'ROLLBACK', 'SAVEPOINT', 'LOCK', 'UNLOCK', 'SHARE', 'CALL',
+        'DO', 'HANDLER', 'LOAD', 'PREPARE', 'EXECUTE', 'DEALLOCATE', 'SET', 'FLUSH', 'RESET', 'SHUTDOWN',
+        'KILL', 'INSTALL', 'UNINSTALL', 'BINLOG', 'PURGE', 'OPTIMIZE', 'REPAIR', 'ANALYZE', 'ANALYSE',
+        'CHECKSUM', 'PROCEDURE', 'INTO', 'OUTFILE', 'DUMPFILE', 'LOAD_FILE', 'SLEEP', 'BENCHMARK',
+        'GET_LOCK', 'RELEASE_LOCK', 'IS_USED_LOCK', 'IS_FREE_LOCK', 'SYS_EXEC', 'SYS_EVAL',
+        // Row-collapsing aggregates: they defeat the row limit by returning a whole column in
+        // one value, bounded only by max_allowed_packet.
+        'GROUP_CONCAT', 'JSON_ARRAYAGG', 'JSON_OBJECTAGG',
+        // Replication waits — arbitrary session blocking. MASTER_POS_WAIT was renamed, so the
+        // current names have to be listed alongside the legacy one.
+        'MASTER_POS_WAIT', 'SOURCE_POS_WAIT', 'WAIT_FOR_EXECUTED_GTID_SET',
+        'WAIT_UNTIL_SQL_THREAD_AFTER_GTIDS',
+    ];
+
+    /**
+     * Read-only built-in functions a diagnostic query realistically needs. Deliberately
+     * conservative: anything not listed is refused, which is what keeps stored functions and
+     * UDFs (any name, including `MODIFIES SQL DATA` ones) out. Extend this list — never the
+     * structural set below — when a legitimate built-in turns out to be missing.
+     */
+    private const ALLOWED_FUNCTIONS = [
+        // Aggregates (row-collapsing ones are denied above) and window functions.
+        'COUNT', 'SUM', 'AVG', 'MIN', 'MAX', 'STD', 'STDDEV', 'STDDEV_POP', 'STDDEV_SAMP', 'VARIANCE',
+        'VAR_POP', 'VAR_SAMP', 'BIT_AND', 'BIT_OR', 'BIT_XOR', 'ANY_VALUE', 'ROW_NUMBER', 'RANK',
+        'DENSE_RANK', 'PERCENT_RANK', 'CUME_DIST', 'NTILE', 'LAG', 'LEAD', 'FIRST_VALUE', 'LAST_VALUE',
+        'NTH_VALUE',
+        // Strings and hashing.
+        'CONCAT', 'CONCAT_WS', 'SUBSTRING', 'SUBSTR', 'MID', 'LEFT', 'RIGHT', 'LENGTH', 'CHAR_LENGTH',
+        'CHARACTER_LENGTH', 'OCTET_LENGTH', 'LOWER', 'UPPER', 'LCASE', 'UCASE', 'TRIM', 'LTRIM', 'RTRIM',
+        'LPAD', 'RPAD', 'REVERSE', 'REPEAT', 'INSTR', 'LOCATE', 'POSITION', 'FIELD', 'FIND_IN_SET', 'ELT',
+        'HEX', 'UNHEX', 'ASCII', 'ORD', 'BIN', 'OCT', 'SPACE', 'STRCMP', 'SUBSTRING_INDEX', 'QUOTE',
+        'FORMAT', 'REGEXP_LIKE', 'REGEXP_INSTR', 'REGEXP_SUBSTR', 'REGEXP_REPLACE', 'TO_BASE64',
+        'FROM_BASE64', 'MD5', 'SHA1', 'SHA2', 'UUID', 'CRC32', 'BIT_COUNT', 'INET_ATON', 'INET_NTOA',
+        // Numbers.
+        'ABS', 'CEIL', 'CEILING', 'FLOOR', 'ROUND', 'MOD', 'POW', 'POWER', 'SQRT', 'EXP', 'LOG', 'LOG2',
+        'LOG10', 'LN', 'SIGN', 'RAND', 'PI', 'GREATEST', 'LEAST', 'DEGREES', 'RADIANS', 'SIN', 'COS',
+        'TAN', 'COT', 'ASIN', 'ACOS', 'ATAN', 'ATAN2',
+        // Dates and times.
+        'NOW', 'CURDATE', 'CURTIME', 'CURRENT_DATE', 'CURRENT_TIME', 'CURRENT_TIMESTAMP', 'LOCALTIME',
+        'LOCALTIMESTAMP', 'UNIX_TIMESTAMP', 'FROM_UNIXTIME', 'DATE', 'TIME', 'TIMESTAMP', 'YEAR', 'MONTH',
+        'DAY', 'DAYOFMONTH', 'DAYOFWEEK', 'DAYOFYEAR', 'WEEK', 'WEEKDAY', 'WEEKOFYEAR', 'HOUR', 'MINUTE',
+        'SECOND', 'MICROSECOND', 'QUARTER', 'MONTHNAME', 'DAYNAME', 'LAST_DAY', 'DATE_ADD', 'DATE_SUB',
+        'DATE_FORMAT', 'STR_TO_DATE', 'DATEDIFF', 'TIMEDIFF', 'TIMESTAMPDIFF', 'TIMESTAMPADD', 'ADDDATE',
+        'SUBDATE', 'ADDTIME', 'SUBTIME', 'MAKEDATE', 'MAKETIME', 'PERIOD_ADD', 'PERIOD_DIFF',
+        'SEC_TO_TIME', 'TIME_TO_SEC', 'TIME_FORMAT', 'UTC_DATE', 'UTC_TIME', 'UTC_TIMESTAMP', 'YEARWEEK',
+        'EXTRACT', 'CONVERT_TZ',
+        // Casts, control flow, and the type names that take a parenthesised precision.
+        'CAST', 'CONVERT', 'IF', 'IFNULL', 'NULLIF', 'COALESCE', 'ISNULL', 'CHAR', 'NCHAR', 'BINARY',
+        'VARBINARY', 'VARCHAR', 'DECIMAL', 'SIGNED', 'UNSIGNED', 'INTEGER', 'DATETIME', 'FLOAT', 'DOUBLE',
+        'JSON',
+        // JSON accessors and constructors (the aggregating ones are denied above).
+        'JSON_EXTRACT', 'JSON_UNQUOTE', 'JSON_VALUE', 'JSON_CONTAINS', 'JSON_CONTAINS_PATH', 'JSON_KEYS',
+        'JSON_LENGTH', 'JSON_DEPTH', 'JSON_TYPE', 'JSON_VALID', 'JSON_QUOTE', 'JSON_OVERLAPS',
+        'JSON_SEARCH', 'JSON_ARRAY', 'JSON_OBJECT',
+        // Server metadata that leaks nothing beyond what SHOW already exposes.
+        'DATABASE', 'VERSION',
+    ];
+
+    /**
+     * Keywords that may legitimately be followed by `(` without naming a function —
+     * subqueries, `IN (…)`, `WITH x AS (…)`, `OVER (…)`, and so on. Only consulted for
+     * unquoted words: a backtick-quoted word before `(` is always a function call.
+     *
+     * Every entry is a *reserved* word in MySQL 8, so none of them can be the unquoted name
+     * of a stored function. That is why `ANY` and `AGAINST` are absent despite being valid
+     * before `(` — they are non-reserved, so exempting them would let `any(1)` call a stored
+     * function. The cost is that `= ANY (subquery)` and fulltext `MATCH … AGAINST (…)` are
+     * unsupported; `IN (subquery)` and `LIKE` cover the realistic cases.
+     */
+    private const STRUCTURAL_KEYWORDS = [
+        'SELECT', 'FROM', 'WHERE', 'HAVING', 'GROUP', 'ORDER', 'BY', 'AND', 'OR', 'XOR', 'NOT', 'IN',
+        'EXISTS', 'AS', 'ON', 'USING', 'JOIN', 'INNER', 'CROSS', 'NATURAL', 'STRAIGHT_JOIN', 'LATERAL',
+        'UNION', 'EXCEPT', 'INTERSECT', 'ALL', 'SOME', 'DISTINCT', 'CASE', 'WHEN', 'THEN', 'ELSE',
+        'IS', 'LIKE', 'RLIKE', 'REGEXP', 'BETWEEN', 'OVER', 'PARTITION', 'MATCH', 'INDEX',
+        'KEY', 'INTERVAL', 'ROW', 'VALUES', 'WITH', 'RECURSIVE',
     ];
 
     /**
@@ -107,6 +185,7 @@ class QueryGuard
 
         $leadingKeyword = $this->assertAllowedLeadingKeyword($tokens);
         $this->assertNoDeniedKeywords($tokens);
+        $this->assertOnlyAllowedFunctions($tokens);
         $this->assertNoDeniedTables($tokens);
         $this->assertNoDeniedColumns($tokens);
 
@@ -146,7 +225,8 @@ class QueryGuard
      */
     private function assertNoControlCharacters(string $sql): void
     {
-        if (preg_match('/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/', $sql) === 1) {
+        // `!== 0` rather than `=== 1`: a PCRE failure returns false and must reject, not pass.
+        if (preg_match('/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/', $sql) !== 0) {
             throw new LocalizedException(
                 __('The query contains a control character. Remove it and try again.')
             );
@@ -230,10 +310,20 @@ class QueryGuard
                 );
             }
 
+            if ($char === '{' || $char === '}') {
+                throw new LocalizedException(
+                    __(
+                        'The query contains `%1`. `{{table_name}}` placeholders must be resolved to real '
+                        . 'table names before the query is validated.',
+                        $char
+                    )
+                );
+            }
+
             if ($char === "'") {
                 $literal = $this->readStringLiteral($sql, $position);
                 $output .= $literal['raw'];
-                $tokens[] = ['type' => self::TYPE_STRING, 'value' => $literal['raw']];
+                $tokens[] = ['type' => self::TYPE_STRING, 'value' => $literal['raw'], 'quoted' => false];
                 $position = $literal['next'];
                 continue;
             }
@@ -241,7 +331,7 @@ class QueryGuard
             if ($char === '`') {
                 $identifier = $this->readQuotedIdentifier($sql, $position);
                 $output .= $identifier['raw'];
-                $tokens[] = ['type' => self::TYPE_WORD, 'value' => $identifier['value']];
+                $tokens[] = ['type' => self::TYPE_WORD, 'value' => $identifier['value'], 'quoted' => true];
                 $position = $identifier['next'];
                 continue;
             }
@@ -256,12 +346,13 @@ class QueryGuard
                 $tokens[] = [
                     'type' => ctype_digit($word) ? self::TYPE_NUMBER : self::TYPE_WORD,
                     'value' => $word,
+                    'quoted' => false,
                 ];
                 continue;
             }
 
             $output .= $char;
-            $tokens[] = ['type' => self::TYPE_PUNCT, 'value' => $char];
+            $tokens[] = ['type' => self::TYPE_PUNCT, 'value' => $char, 'quoted' => false];
             $position++;
         }
 
@@ -281,7 +372,11 @@ class QueryGuard
     }
 
     /**
-     * Reads a `'…'` literal, honouring `\'` escapes and `''` doubling.
+     * Reads a `'…'` literal. Backslashes are refused outright: whether `\` escapes the next
+     * byte depends on the server's `NO_BACKSLASH_ESCAPES` sql_mode (and on the connection
+     * charset, where 0x5C can be a trail byte), so honouring it would make our literal
+     * boundaries disagree with the server's on the very string we hand back for execution.
+     * `''` doubling embeds a quote identically under every mode.
      *
      * @param string $sql
      * @param int $position Index of the opening quote.
@@ -298,12 +393,13 @@ class QueryGuard
             $char = $sql[$position];
 
             if ($char === '\\') {
-                if ($position + 1 >= $length) {
-                    break;
-                }
-                $raw .= $char . $sql[$position + 1];
-                $position += 2;
-                continue;
+                throw new LocalizedException(
+                    __(
+                        'Backslashes are not accepted inside string literals, because whether `\\` escapes '
+                        . 'the next character depends on the server\'s sql_mode. Use `\'\'` to embed a '
+                        . 'single quote.'
+                    )
+                );
             }
 
             if ($char === "'") {
@@ -462,6 +558,47 @@ class QueryGuard
                     __('The keyword `%1` is not permitted in a read-only query.', $keyword)
                 );
             }
+        }
+    }
+
+    // ------------------------------------------------- layer 4b: function allowlist
+
+    /**
+     * Every `name(` in the statement must name a built-in read-only function. Stored
+     * functions and UDFs are refused whatever they are called, since a name-based deny-list
+     * cannot know that `helper_totals()` is declared MODIFIES SQL DATA.
+     *
+     * @param list<SqlToken> $tokens
+     * @return void
+     * @throws LocalizedException
+     */
+    private function assertOnlyAllowedFunctions(array $tokens): void
+    {
+        foreach ($tokens as $index => $token) {
+            if ($token['type'] !== self::TYPE_WORD) {
+                continue;
+            }
+
+            $next = $tokens[$index + 1] ?? null;
+            if ($next === null || $next['type'] !== self::TYPE_PUNCT || $next['value'] !== '(') {
+                continue;
+            }
+
+            $name = strtoupper($token['value']);
+            if (in_array($name, self::ALLOWED_FUNCTIONS, true)) {
+                continue;
+            }
+            if (!$token['quoted'] && in_array($name, self::STRUCTURAL_KEYWORDS, true)) {
+                continue;
+            }
+
+            throw new LocalizedException(
+                __(
+                    '`%1()` is not a permitted function. Only built-in read-only functions are accepted; '
+                    . 'stored functions and user-defined functions are always refused.',
+                    $token['value']
+                )
+            );
         }
     }
 

@@ -276,7 +276,28 @@ class QueryGuardTest extends TestCase
             'PREPARE' => ['SELECT PREPARE FROM t', 'PREPARE'],
             'EXECUTE' => ['SELECT EXECUTE FROM t', 'EXECUTE'],
             'DEALLOCATE' => ['SELECT DEALLOCATE FROM t', 'DEALLOCATE'],
+            'MERGE' => ['SELECT MERGE FROM t', 'MERGE'],
+            'DO' => ['SELECT entity_id FROM t WHERE DO = 1', 'DO'],
+            'UNINSTALL' => ['SELECT UNINSTALL FROM t', 'UNINSTALL'],
+            'SHARE' => ['SELECT entity_id FROM t FOR SHARE', 'SHARE'],
             'SET' => ['SELECT entity_id FROM t WHERE SET = 1', 'SET'],
+            'RELEASE_LOCK' => ["SELECT RELEASE_LOCK('a')", 'RELEASE_LOCK'],
+            'IS_USED_LOCK' => ["SELECT IS_USED_LOCK('a')", 'IS_USED_LOCK'],
+            'IS_FREE_LOCK' => ["SELECT IS_FREE_LOCK('a')", 'IS_FREE_LOCK'],
+            'MASTER_POS_WAIT' => ["SELECT MASTER_POS_WAIT('log', 1)", 'MASTER_POS_WAIT'],
+            'SOURCE_POS_WAIT' => ["SELECT SOURCE_POS_WAIT('log', 1)", 'SOURCE_POS_WAIT'],
+            'WAIT_FOR_EXECUTED_GTID_SET' => ["SELECT WAIT_FOR_EXECUTED_GTID_SET('x')", 'WAIT_FOR_EXECUTED_GTID_SET'],
+            'WAIT_UNTIL_SQL_THREAD_AFTER_GTIDS' => [
+                "SELECT WAIT_UNTIL_SQL_THREAD_AFTER_GTIDS('x')",
+                'WAIT_UNTIL_SQL_THREAD_AFTER_GTIDS',
+            ],
+            'SYS_EVAL' => ["SELECT SYS_EVAL('id')", 'SYS_EVAL'],
+            'GROUP_CONCAT' => ['SELECT GROUP_CONCAT(email) FROM customer_entity', 'GROUP_CONCAT'],
+            'JSON_ARRAYAGG' => ['SELECT JSON_ARRAYAGG(email) FROM customer_entity LIMIT 100', 'JSON_ARRAYAGG'],
+            'JSON_OBJECTAGG' => [
+                'SELECT JSON_OBJECTAGG(entity_id, email) FROM customer_entity',
+                'JSON_OBJECTAGG',
+            ],
             'FLUSH' => ['SELECT FLUSH FROM t', 'FLUSH'],
             'RESET' => ['SELECT RESET FROM t', 'RESET'],
             'SHUTDOWN' => ['SELECT SHUTDOWN FROM t', 'SHUTDOWN'],
@@ -386,12 +407,47 @@ class QueryGuardTest extends TestCase
         );
     }
 
-    public function testRejectsDangerousCodeAfterEscapedQuoteLiteral(): void
+    /**
+     * The `NO_BACKSLASH_ESCAPES` divergence. With even backslash parity the payload's literal
+     * closes cleanly for us while MySQL sees the literal end at the backslash — everything
+     * after it would execute unscanned. Refusing `\` is what makes our lexer mode-independent.
+     *
+     * @return void
+     */
+    public function testRejectsBackslashSmuggledUnionWithEvenQuoteParity(): void
     {
         $this->assertRejected(
-            "SELECT entity_id FROM customer_entity WHERE firstname = 'it\\'s' AND password_hash = 'x'",
-            'password_hash'
+            "SELECT firstname FROM customer_entity WHERE firstname='a\\' UNION SELECT password "
+            . "FROM admin_user-- '",
+            'backslash'
         );
+    }
+
+    public function testRejectsBackslashSmuggledStatementSeparator(): void
+    {
+        $this->assertRejected(
+            "SELECT firstname FROM customer_entity WHERE firstname='a\\';UPDATE admin_user "
+            . "SET reload_acl_flag=1-- '",
+            'backslash'
+        );
+    }
+
+    public function testRejectsBackslashInsideLiteralWithOddParity(): void
+    {
+        $this->assertRejected("SELECT entity_id FROM customer_entity WHERE firstname = 'it\\'s'", 'backslash');
+    }
+
+    public function testRejectsPlainBackslashInsideLiteral(): void
+    {
+        // Control case: the rule is unconditional, not parity-dependent.
+        $this->assertRejected("SELECT entity_id FROM customer_entity WHERE firstname = 'a\\\\b'", 'backslash');
+    }
+
+    public function testAllowsDoubledQuoteToEmbedAQuote(): void
+    {
+        // The mode-independent replacement for `\'`.
+        $sql = "SELECT entity_id FROM customer_entity WHERE lastname = 'O''Brien'";
+        $this->assertSame($sql . ' LIMIT 100', $this->guard()->assertReadOnly($sql));
     }
 
     public function testRejectsDangerousCodeAfterDoubledQuoteLiteral(): void
@@ -424,6 +480,93 @@ class QueryGuardTest extends TestCase
     public function testRejectsUnterminatedStringLiteral(): void
     {
         $this->assertRejected("SELECT entity_id FROM customer_entity WHERE firstname = 'oops", 'unterminated');
+    }
+
+    // ---------------------------------------------------------------- layer 4b: function allowlist
+
+    public function testRejectsStoredFunctionCall(): void
+    {
+        $this->assertRejected('SELECT my_project_func(1) FROM customer_entity', 'not a permitted function');
+    }
+
+    public function testRejectsStoredFunctionCallWithSpaceBeforeParenthesis(): void
+    {
+        // Whitespace is allowed before `(` for stored functions, so the check is token-based.
+        $this->assertRejected('SELECT my_project_func (1) FROM customer_entity', 'not a permitted function');
+    }
+
+    public function testRejectsQualifiedStoredFunctionCall(): void
+    {
+        $this->assertRejected('SELECT other_db.helper_totals(1) FROM customer_entity', 'not a permitted function');
+    }
+
+    public function testRejectsBacktickQuotedFunctionName(): void
+    {
+        $this->assertRejected('SELECT `my_project_func`(1) FROM customer_entity', 'not a permitted function');
+    }
+
+    public function testRejectsFunctionNamedAfterAStructuralKeyword(): void
+    {
+        // A quoted word before `(` never earns the structural exemption.
+        $this->assertRejected('SELECT `values`(1) FROM customer_entity', 'not a permitted function');
+    }
+
+    public function testRejectsFunctionNamedAfterANonReservedKeyword(): void
+    {
+        // `ANY` and `AGAINST` are non-reserved, so they could name a stored function invoked
+        // unquoted; they are deliberately absent from the structural exemption.
+        $this->assertRejected('SELECT any(1) FROM customer_entity', 'not a permitted function');
+        $this->assertRejected('SELECT against(1) FROM customer_entity', 'not a permitted function');
+    }
+
+    /**
+     * @return array<string, array{string}>
+     */
+    public static function allowedFunctionQueryProvider(): array
+    {
+        return [
+            'aggregates' => ['SELECT COUNT(*), MAX(created_at), MIN(created_at) FROM customer_entity'],
+            'strings' => ["SELECT CONCAT(firstname, ' ', lastname), LENGTH(email) FROM customer_entity"],
+            'dates' => ["SELECT DATE_FORMAT(created_at, '%Y-%m') FROM sales_order"],
+            'cast with precision' => ['SELECT CAST(grand_total AS DECIMAL(12,4)) FROM sales_order'],
+            'control flow' => ["SELECT IFNULL(coupon_code, '-'), IF(state = 'new', 1, 0) FROM sales_order"],
+            'json accessor' => ["SELECT JSON_EXTRACT(additional_information, '$.x') FROM sales_order_payment"],
+            'window function' => [
+                'SELECT ROW_NUMBER() OVER (PARTITION BY store_id ORDER BY entity_id) FROM sales_order',
+            ],
+            'in list' => ['SELECT entity_id FROM customer_entity WHERE entity_id IN (1, 2, 3)'],
+            'subquery source' => ['SELECT c.entity_id FROM (SELECT entity_id FROM customer_entity) c'],
+            'join using' => [
+                'SELECT o.entity_id FROM sales_order o JOIN sales_order_grid g USING (entity_id)',
+            ],
+            'exists subquery' => [
+                'SELECT entity_id FROM customer_entity WHERE EXISTS (SELECT 1 FROM sales_order)',
+            ],
+            'grouped expression' => ['SELECT entity_id FROM sales_order WHERE (store_id = 1 AND state IS NULL)'],
+            'case expression' => ["SELECT CASE WHEN (store_id = 1) THEN 'a' ELSE 'b' END FROM sales_order"],
+        ];
+    }
+
+    /**
+     * @dataProvider allowedFunctionQueryProvider
+     * @param string $sql
+     * @return void
+     */
+    public function testAcceptsAllowlistedFunctionsAndStructuralParentheses(string $sql): void
+    {
+        $this->assertSame($sql . ' LIMIT 100', $this->guard()->assertReadOnly($sql));
+    }
+
+    // ---------------------------------------------------------------- unsubstituted placeholders
+
+    public function testRejectsUnsubstitutedTablePlaceholder(): void
+    {
+        $this->assertRejected('SELECT entity_id FROM {{customer_entity}}', 'placeholder');
+    }
+
+    public function testRejectsStrayClosingBrace(): void
+    {
+        $this->assertRejected('SELECT entity_id FROM customer_entity}', 'placeholder');
     }
 
     // ---------------------------------------------------------------- layer 5: table denylist
@@ -528,6 +671,17 @@ class QueryGuardTest extends TestCase
         $this->assertRejected('SHOW PROCESSLIST', 'processlist');
     }
 
+    public function testRejectsInnodbTrx(): void
+    {
+        // Same threat as PROCESSLIST: other sessions' SQL text, literals included.
+        $this->assertRejected('SELECT trx_id, trx_query FROM information_schema.innodb_trx', 'innodb_trx');
+    }
+
+    public function testRejectsUserPrivilegesView(): void
+    {
+        $this->assertRejected('SELECT grantee FROM information_schema.user_privileges', 'user_privileges');
+    }
+
     public function testAllowsPermittedTable(): void
     {
         $this->assertSame(
@@ -560,6 +714,10 @@ class QueryGuardTest extends TestCase
                 "SELECT entity_id FROM customer_entity WHERE password_hash LIKE 'a%'",
                 'password_hash',
             ],
+            'cc_last4' => ['SELECT cc_last4 FROM sales_order_payment', 'cc_last4'],
+            'cc_owner' => ['SELECT cc_owner FROM sales_order_payment', 'cc_owner'],
+            'cc_number_enc' => ['SELECT cc_number_enc FROM sales_order_payment', 'cc_number_enc'],
+            'cc_cid_enc' => ['SELECT cc_cid_enc FROM quote_payment', 'cc_cid_enc'],
         ];
     }
 
