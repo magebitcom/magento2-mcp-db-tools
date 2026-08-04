@@ -479,8 +479,15 @@ class QueryTest extends TestCase
         self::assertSame(1, $response['row_count']);
         // Exactly one sql_mode attempt: assigning a literal mode set would drop the session's
         // existing modes (STRICT_TRANS_TABLES among them) for the rest of the request.
-        self::assertCount(1, array_filter($this->statements, static fn (string $s): bool => str_contains($s, 'sql_mode')));
-        self::assertSame('SELECT entity_id FROM sales_order LIMIT 100', $this->statements[count($this->statements) - 1]);
+        $sqlModeStatements = array_filter(
+            $this->statements,
+            static fn (string $statement): bool => str_contains($statement, 'sql_mode')
+        );
+        self::assertCount(1, $sqlModeStatements);
+        self::assertSame(
+            'SELECT entity_id FROM sales_order LIMIT 100',
+            $this->statements[count($this->statements) - 1]
+        );
     }
 
     public function testStatementErrorOnExecutionSurfacesTheServerMessage(): void
@@ -678,6 +685,46 @@ class QueryTest extends TestCase
 
         $tool = new Query($this->config, $this->guard, $resourceConnection, $this->logger);
         $tool->execute(['query' => 'SELECT entity_id FROM sales_order']);
+    }
+
+    public function testResultBufferingIsNotRestoredOnAConnectionThatWasDropped(): void
+    {
+        $calls = [];
+        $pdo = $this->createMock(\PDO::class);
+        $pdo->method('getAttribute')->willReturn(true);
+        $pdo->method('setAttribute')->willReturnCallback(
+            static function (int $attribute, $value) use (&$calls): bool {
+                if ($attribute === \PDO::MYSQL_ATTR_USE_BUFFERED_QUERY) {
+                    $calls[] = $value;
+                }
+                return true;
+            }
+        );
+
+        $statement = $this->createMock(\Zend_Db_Statement_Interface::class);
+        $statement->method('fetch')->willReturn(false);
+        $statement->method('closeCursor')->willThrowException(new \RuntimeException('cursor stuck'));
+
+        $adapter = $this->getMockBuilder(\Magento\Framework\DB\Adapter\Pdo\Mysql::class)
+            ->disableOriginalConstructor()
+            ->onlyMethods(['query', 'fetchOne', 'getConnection', 'closeConnection'])
+            ->getMock();
+        $adapter->method('fetchOne')->willReturn('8.0.36');
+        $adapter->method('getConnection')->willReturn($pdo);
+        $adapter->method('query')->willReturn($statement);
+        $adapter->expects(self::once())->method('closeConnection');
+
+        $resourceConnection = $this->createMock(ResourceConnection::class);
+        $resourceConnection->method('getConnection')->willReturn($adapter);
+        $this->guard->method('assertReadOnly')->willReturn('SELECT entity_id FROM sales_order LIMIT 100');
+        // The dropped connection is a warning, never the `error` line about a failed restore.
+        $this->logger->expects(self::once())->method('warning');
+        $this->logger->expects(self::never())->method('error');
+
+        $tool = new Query($this->config, $this->guard, $resourceConnection, $this->logger);
+        $tool->execute(['query' => 'SELECT entity_id FROM sales_order']);
+
+        self::assertSame([false], $calls, 'An orphaned handle must not be written to.');
     }
 
     public function testLimitArgumentReachesTheGuard(): void

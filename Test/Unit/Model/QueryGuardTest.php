@@ -663,7 +663,10 @@ class QueryGuardTest extends TestCase
             'oauth_consumer' => ['SELECT entity_id FROM oauth_consumer', 'oauth_consumer'],
             'oauth_token_request_log' => ['SELECT log_id FROM oauth_token_request_log', 'oauth_token_request_log'],
             'magebit_mcp_token' => ['SELECT token_id FROM magebit_mcp_token', 'magebit_mcp_token'],
-            'magebit_mcp_oauth_client' => ['SELECT client_id FROM magebit_mcp_oauth_client', 'magebit_mcp_oauth_client'],
+            'magebit_mcp_oauth_client' => [
+                'SELECT client_id FROM magebit_mcp_oauth_client',
+                'magebit_mcp_oauth_client',
+            ],
             'magebit_mcp_oauth_auth_code' => [
                 'SELECT code_id FROM magebit_mcp_oauth_auth_code',
                 'magebit_mcp_oauth_auth_code',

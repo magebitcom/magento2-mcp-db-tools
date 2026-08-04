@@ -486,6 +486,11 @@ class Query implements ToolInterface, UnderlyingAclAwareInterface
      * `query()` time — Magento sets `MYSQL_ATTR_USE_BUFFERED_QUERY` on connect — and no cap applied
      * afterwards can bound memory.
      *
+     * One attempt escapes that bound: Magento retries a statement failing with MySQL 2006/2013 on a
+     * fresh connection, and `closeConnection()` leaves `_connectionFlagsSet` set, so `_connect()`
+     * skips the attribute block and the new handle keeps PDO's buffered default. The shared
+     * connection is never left unbuffered, but the retried attempt reads buffered.
+     *
      * @param AdapterInterface $connection
      * @param string $executable
      * @return array{columns: list<string>, rows: list<array<string, mixed>>, truncated: bool}
@@ -494,11 +499,16 @@ class Query implements ToolInterface, UnderlyingAclAwareInterface
     private function streamRows(AdapterInterface $connection, string $executable): array
     {
         $buffering = $this->suspendResultBuffering($connection);
+        $connectionDropped = false;
 
         try {
-            return $this->readRows($connection, $executable);
+            return $this->readRows($connection, $executable, $connectionDropped);
         } finally {
-            $this->restoreResultBuffering($buffering);
+            // Nothing inherits a dropped connection, so restoring the attribute on its orphaned
+            // handle would only risk an error-level line about a situation that is already handled.
+            if (!$connectionDropped) {
+                $this->restoreResultBuffering($buffering);
+            }
         }
     }
 
@@ -508,10 +518,11 @@ class Query implements ToolInterface, UnderlyingAclAwareInterface
      *
      * @param AdapterInterface $connection
      * @param string $executable Executed verbatim; also echoed back, so it counts against the budget.
+     * @param bool $connectionDropped Set to true when closing the cursor cost us the connection.
      * @return array{columns: list<string>, rows: list<array<string, mixed>>, truncated: bool}
      * @throws LocalizedException On any driver failure, or when the first row alone exceeds the cap.
      */
-    private function readRows(AdapterInterface $connection, string $executable): array
+    private function readRows(AdapterInterface $connection, string $executable, bool &$connectionDropped): array
     {
         $budget = self::MAX_PAYLOAD_BYTES - self::PAYLOAD_OVERHEAD_BYTES - strlen($executable);
         $statement = $this->runStatement($connection, $executable);
@@ -551,7 +562,7 @@ class Query implements ToolInterface, UnderlyingAclAwareInterface
                 $used += $size;
             }
         } finally {
-            $this->closeCursor($connection, $statement);
+            $connectionDropped = $this->closeCursor($connection, $statement);
         }
 
         return ['columns' => $columns, 'rows' => $rows, 'truncated' => $truncated];
@@ -629,16 +640,20 @@ class Query implements ToolInterface, UnderlyingAclAwareInterface
 
     /**
      * An unbuffered cursor left open would fail every later query on this connection — the audit
-     * log insert included — so a cursor that will not close costs us the connection instead.
+     * log insert included — so a cursor that will not close costs us the connection instead. Note
+     * that dropping the connection also discards any transaction open on it; only reachable when the
+     * cursor refuses to close, and an MCP call has no transaction of its own open at this point.
      *
      * @param AdapterInterface $connection
      * @param \Zend_Db_Statement_Interface $statement
-     * @return void
+     * @return bool Whether the connection had to be dropped.
      */
-    private function closeCursor(AdapterInterface $connection, \Zend_Db_Statement_Interface $statement): void
+    private function closeCursor(AdapterInterface $connection, \Zend_Db_Statement_Interface $statement): bool
     {
         try {
             $statement->closeCursor();
+
+            return false;
         } catch (Throwable $exception) {
             $this->logger->warning(
                 'db.query could not close its cursor; dropping the connection so nothing inherits it.',
@@ -653,6 +668,8 @@ class Query implements ToolInterface, UnderlyingAclAwareInterface
             } catch (Throwable) {
                 // Nothing further to do: the next caller gets a fresh connection either way.
             }
+
+            return true;
         }
     }
 
