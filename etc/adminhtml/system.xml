@@ -12,21 +12,25 @@
                 It is off by default, gated by its own ACL resource
                 (<em>Tool: Run Read-Only SQL Query</em>), and rejects anything that is not a single
                 <code>SELECT</code>.</p>
-                <p>Even so, a read-only query can still expose customer PII, order history, admin
-                account rows, and configuration values. Treat "who may enable this" and "which token
-                holds the ACL" as security decisions, not convenience ones.</p>]]></comment>
+                <p>Access is <strong>allowlist-only</strong>: the tool can read the tables named in
+                <em>Allowed Tables</em> and nothing else, and it refuses every query — including
+                <code>SELECT 1</code> — while that field is empty. A small set of tables (admin
+                accounts, tokens, sessions, <code>core_config_data</code>, the server's own schemas)
+                is protected in code and stays unreadable even if it is listed there.</p>
+                <p>Even so, a read-only query can still expose customer PII and order history from
+                the tables you do allow. Treat "who may enable this", "which tables are listed" and
+                "which token holds the ACL" as security decisions, not convenience ones.</p>]]></comment>
                 <field id="enabled" translate="label comment" type="select" sortOrder="10"
                        showInDefault="1" showInWebsite="0" showInStore="0">
                     <label>Enable Read-Only SQL Tool</label>
                     <source_model>Magento\Config\Model\Config\Source\Yesno</source_model>
                     <comment><![CDATA[<strong>Default: No.</strong> Setting this to <strong>Yes</strong>
-                    grants read access to <em>most of this store's database</em> to any MCP token whose
-                    admin role holds the <em>Tool: Run Read-Only SQL Query</em> ACL resource — customer
-                    records, addresses, order and payment metadata, quotes, and configuration values
-                    included. Queries are restricted to a single read-only <code>SELECT</code> and a
-                    deny-list blocks the most sensitive tables, but everything else is readable.
-                    Only enable this if you intend to give those token holders that level of access,
-                    and keep the ACL resource off every role that does not need it.]]></comment>
+                    lets any MCP token whose admin role holds the <em>Tool: Run Read-Only SQL Query</em>
+                    ACL resource read the tables you list in <em>Allowed Tables</em> — nothing more, and
+                    nothing at all until that list is filled in. Queries are restricted to a single
+                    read-only <code>SELECT</code>. Only enable this if you intend to give those token
+                    holders direct read access to the tables you allow, and keep the ACL resource off
+                    every role that does not need it.]]></comment>
                 </field>
                 <field id="default_rows" translate="label comment" type="text" sortOrder="20"
                        showInDefault="1" showInWebsite="0" showInStore="0">
@@ -55,16 +59,52 @@
                     brake: without it a single unindexed join can pin a database thread and starve the
                     storefront. Raise it only if you accept that risk. Default <code>10</code>.]]></comment>
                 </field>
+                <field id="allowed_tables" translate="label comment" type="textarea" sortOrder="45"
+                       showInDefault="1" showInWebsite="0" showInStore="0">
+                    <label>Allowed Tables</label>
+                    <depends><field id="enabled">1</field></depends>
+                    <comment><![CDATA[<p><strong>The tool can read these tables and no others.</strong>
+                    One bare table name per line — no schema prefix, no quoting, no wildcards. Blank
+                    lines and lines starting with <code>#</code> are ignored. If your install uses a
+                    table prefix, list names without it.</p>
+                    <p><strong>Empty means every query is refused</strong>, including
+                    <code>SELECT 1</code>. That is the shipped default: enabling the tool and deciding
+                    what it may see are two separate decisions.</p>
+                    <p>A starting point to paste and trim — <em>not</em> a recommendation to expose
+                    these tables. Review every line against your own data-protection obligations, and
+                    remove anything you do not actively need:</p>
+                    <pre>catalog_product_entity
+catalog_product_entity_varchar
+catalog_product_entity_int
+catalog_product_entity_decimal
+catalog_category_entity
+catalog_category_product
+cataloginventory_stock_item
+eav_attribute
+eav_entity_type
+store
+store_website
+store_group
+cms_page
+cms_block
+sales_order
+sales_order_item
+sales_order_status_history</pre>
+                    <p>Note that order tables carry customer names, e-mail addresses and totals, and
+                    that a few tables (admin accounts, tokens, sessions, <code>core_config_data</code>,
+                    the server's own schemas) stay unreadable however they are listed.</p>]]></comment>
+                </field>
                 <field id="extra_denied_tables" translate="label comment" type="textarea" sortOrder="50"
                        showInDefault="1" showInWebsite="0" showInStore="0">
                     <label>Additional Denied Tables</label>
                     <depends><field id="enabled">1</field></depends>
-                    <comment><![CDATA[<p>One table name per line, added to the module's built-in
-                    deny-list. Blank lines and lines starting with <code>#</code> are ignored.</p>
-                    <p>Use this to protect data the built-in list cannot know about — custom tables
-                    holding credentials, API keys, tokens, or regulated customer data. Entries here
-                    only ever <em>add</em> restrictions; they cannot re-open a table the module already
-                    denies.]]></comment>
+                    <comment><![CDATA[<p>One table name per line, protected on top of the allowlist.
+                    Blank lines and lines starting with <code>#</code> are ignored.</p>
+                    <p>Rarely needed now that access is allowlist-only — its use is belt and braces
+                    for a name you want blocked even if someone later adds it to <em>Allowed
+                    Tables</em>, and it matches wrapper tables too (a denied <code>my_vault</code>
+                    also blocks <code>my_vault_archive</code>). Entries here only ever <em>remove</em>
+                    access; they can never grant it.]]></comment>
                 </field>
             </group>
         </section>

@@ -9,8 +9,13 @@
                 <default_rows>100</default_rows>
                 <row_limit_ceiling>1000</row_limit_ceiling>
                 <statement_timeout_seconds>10</statement_timeout_seconds>
+                <!-- Empty on purpose: with no table listed, every query is refused. Enabling the
+                     tool and choosing what it may read are two deliberate acts. -->
+                <allowed_tables># One table name per line. Lines starting with # are ignored.
+# Only the tables listed here can be read. While this list is empty, every query is refused.
+# See the field comment in the admin for a starter list you can paste and trim.</allowed_tables>
                 <extra_denied_tables># One table name per line. Lines starting with # are ignored.
-# Listed tables are added to the module's built-in deny-list and can never be read.</extra_denied_tables>
+# Listed tables are protected on top of the allowlist and can never be read.</extra_denied_tables>
             </db_tools>
         </magebit_mcp>
     </default>

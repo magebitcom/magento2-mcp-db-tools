@@ -20,6 +20,7 @@ class DbToolsConfig
     public const XML_PATH_DEFAULT_ROWS = 'magebit_mcp/db_tools/default_rows';
     public const XML_PATH_ROW_LIMIT_CEILING = 'magebit_mcp/db_tools/row_limit_ceiling';
     public const XML_PATH_STATEMENT_TIMEOUT_SECONDS = 'magebit_mcp/db_tools/statement_timeout_seconds';
+    public const XML_PATH_ALLOWED_TABLES = 'magebit_mcp/db_tools/allowed_tables';
     public const XML_PATH_EXTRA_DENIED_TABLES = 'magebit_mcp/db_tools/extra_denied_tables';
 
     public const DEFAULT_ROWS = 100;
@@ -72,14 +73,36 @@ class DbToolsConfig
     }
 
     /**
-     * Operator-supplied additions to the built-in table deny-list. One name per line;
-     * blank lines and `#` comment lines are ignored.
+     * The only tables the SQL tool may read. Empty — the shipped default — means every query is
+     * refused, so enabling the tool and choosing what it can see stay two deliberate acts.
+     *
+     * @return list<string>
+     */
+    public function getAllowedTables(): array
+    {
+        return $this->readTableList(self::XML_PATH_ALLOWED_TABLES);
+    }
+
+    /**
+     * Operator-supplied additions to the protected set, on top of the allowlist. Entries here
+     * only ever remove access; they cannot grant it.
      *
      * @return list<string>
      */
     public function getExtraDeniedTables(): array
     {
-        $raw = $this->scopeConfig->getValue(self::XML_PATH_EXTRA_DENIED_TABLES);
+        return $this->readTableList(self::XML_PATH_EXTRA_DENIED_TABLES);
+    }
+
+    /**
+     * One name per line; blank lines and `#` comment lines are ignored.
+     *
+     * @param string $path
+     * @return list<string>
+     */
+    private function readTableList(string $path): array
+    {
+        $raw = $this->scopeConfig->getValue($path);
         if (!is_string($raw) || trim($raw) === '') {
             return [];
         }

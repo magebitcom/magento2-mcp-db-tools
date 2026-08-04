@@ -8,41 +8,105 @@ declare(strict_types=1);
 
 namespace Magebit\McpDbTools\Test\Unit\Model;
 
+use Magebit\McpDbTools\Model\ColumnDenyList;
 use Magebit\McpDbTools\Model\Config\DbToolsConfig;
-use Magebit\McpDbTools\Model\DenyList;
+use Magebit\McpDbTools\Model\IdentifierMatcher;
 use Magebit\McpDbTools\Model\QueryGuard;
+use Magebit\McpDbTools\Model\TableAccessPolicy;
 use Magento\Framework\App\DeploymentConfig;
+use Magento\Framework\Config\ConfigOptionsListConstants;
 use Magento\Framework\Exception\LocalizedException;
 use PHPUnit\Framework\TestCase;
 
 /**
- * Bypass-focused coverage of the eight guard layers. Every rejection asserts on the
- * message so a refactor cannot quietly swap one layer's verdict for another's.
+ * Bypass-focused coverage of the guard layers. Every rejection asserts on the message so a
+ * refactor cannot quietly swap one layer's verdict for another's.
+ *
+ * The protected set is read out of the module's own `etc/di.xml`, not restated here: a test
+ * copy would keep passing after someone shortened the shipped array.
  */
 class QueryGuardTest extends TestCase
 {
     /**
+     * Tables the bulk of the suite reads from. Tests that exercise the allowlist itself pass
+     * their own list instead.
+     */
+    private const ALLOWED_TABLES = [
+        'customer_entity',
+        'catalog_product_entity',
+        'catalog_product_index_price',
+        'sales_order',
+        'sales_order_grid',
+        'sales_order_payment',
+        'quote_payment',
+        'some_table',
+        't',
+        't2',
+    ];
+
+    /**
      * @param int $defaultRows
      * @param int $ceiling
+     * @param list<string>|null $allowedTables Null uses {@see self::ALLOWED_TABLES}.
      * @param list<string> $extraDeniedTables
      * @param string $tablePrefix
+     * @param string $databaseName
      * @return QueryGuard
      */
     private function guard(
         int $defaultRows = 100,
         int $ceiling = 1000,
+        ?array $allowedTables = null,
         array $extraDeniedTables = [],
-        string $tablePrefix = ''
+        string $tablePrefix = '',
+        string $databaseName = 'magento'
     ): QueryGuard {
         $config = $this->createMock(DbToolsConfig::class);
         $config->method('getDefaultRows')->willReturn($defaultRows);
         $config->method('getRowLimitCeiling')->willReturn($ceiling);
+        $config->method('getAllowedTables')->willReturn($allowedTables ?? self::ALLOWED_TABLES);
         $config->method('getExtraDeniedTables')->willReturn($extraDeniedTables);
 
         $deploymentConfig = $this->createMock(DeploymentConfig::class);
-        $deploymentConfig->method('get')->willReturn($tablePrefix);
+        $deploymentConfig->method('get')->willReturnCallback(
+            static fn (string $path): ?string => match ($path) {
+                ConfigOptionsListConstants::CONFIG_PATH_DB_PREFIX => $tablePrefix,
+                IdentifierMatcher::CONFIG_PATH_DB_NAME => $databaseName,
+                default => null,
+            }
+        );
 
-        return new QueryGuard($config, new DenyList($config, $deploymentConfig));
+        $matcher = new IdentifierMatcher($deploymentConfig);
+        $policy = new TableAccessPolicy(
+            $config,
+            $matcher,
+            self::diArgument('protectedTables'),
+            self::diArgument('protectedIdentifiers')
+        );
+
+        return new QueryGuard($config, $policy, new ColumnDenyList($matcher));
+    }
+
+    /**
+     * Reads one DI array argument of {@see TableAccessPolicy} out of the shipped `etc/di.xml`.
+     *
+     * @param string $name
+     * @return list<string>
+     */
+    private static function diArgument(string $name): array
+    {
+        $xml = simplexml_load_file(__DIR__ . '/../../../etc/di.xml');
+        self::assertNotFalse($xml, 'etc/di.xml is not readable.');
+
+        $items = $xml->xpath(
+            sprintf(
+                '//type[@name="Magebit\McpDbTools\Model\TableAccessPolicy"]/arguments/argument[@name="%s"]/item',
+                $name
+            )
+        );
+        self::assertNotEmpty($items, sprintf('di.xml declares no `%s` items.', $name));
+
+        return array_values(array_map(static fn (\SimpleXMLElement $item): string => (string) $item, $items));
     }
 
     /**
@@ -52,8 +116,19 @@ class QueryGuardTest extends TestCase
      */
     private function assertRejected(string $sql, string $expectedMessageFragment): void
     {
+        $this->assertRejectedBy($this->guard(), $sql, $expectedMessageFragment);
+    }
+
+    /**
+     * @param QueryGuard $guard
+     * @param string $sql
+     * @param string $expectedMessageFragment
+     * @return void
+     */
+    private function assertRejectedBy(QueryGuard $guard, string $sql, string $expectedMessageFragment): void
+    {
         try {
-            $this->guard()->assertReadOnly($sql);
+            $guard->assertReadOnly($sql);
             $this->fail(sprintf('Expected rejection of: %s', $sql));
         } catch (LocalizedException $e) {
             $this->assertStringContainsStringIgnoringCase(
@@ -615,7 +690,7 @@ class QueryGuardTest extends TestCase
 
     public function testRejectsPrefixedDeniedTable(): void
     {
-        $guard = $this->guard(100, 1000, [], 'mage_');
+        $guard = $this->guard(100, 1000, null, [], 'mage_');
         $this->expectException(LocalizedException::class);
         $this->expectExceptionMessageMatches('/admin_user/');
         $guard->assertReadOnly('SELECT email FROM mage_admin_user');
@@ -649,7 +724,8 @@ class QueryGuardTest extends TestCase
 
     public function testRejectsExtraDeniedTableFromConfig(): void
     {
-        $guard = $this->guard(100, 1000, ['my_vault']);
+        // Also the config-level half of deny-after-allow: the table is allowlisted and still refused.
+        $guard = $this->guard(100, 1000, ['my_vault'], ['my_vault']);
         $this->expectException(LocalizedException::class);
         $this->expectExceptionMessageMatches('/my_vault/');
         $guard->assertReadOnly('SELECT a FROM my_vault');
@@ -921,5 +997,476 @@ class QueryGuardTest extends TestCase
     public function testFindRowLimitReadsOffsetPairRowCount(): void
     {
         $this->assertSame(50, $this->guard()->findRowLimit('SELECT entity_id FROM t LIMIT 20, 50'));
+    }
+
+    // ------------------------------------------------ the protected set is the shipped one
+
+    public function testDiXmlStillProtectsEverySeededName(): void
+    {
+        $protected = array_merge(self::diArgument('protectedTables'), self::diArgument('protectedIdentifiers'));
+
+        foreach (
+            [
+                'admin_user', 'admin_passwords', 'admin_user_session', 'admin_user_expiration', 'oauth_token',
+                'oauth_consumer', 'oauth_token_request_log', 'magebit_mcp_token', 'magebit_mcp_oauth_client',
+                'magebit_mcp_oauth_auth_code', 'magebit_mcp_oauth_refresh_token', 'persistent_session',
+                'password_reset_request_event', 'core_config_data', 'mysql', 'information_schema',
+                'performance_schema', 'sys', 'processlist', 'innodb_trx', 'user_privileges',
+            ] as $name
+        ) {
+            $this->assertContains($name, $protected, sprintf('`%s` is no longer protected by di.xml.', $name));
+        }
+    }
+
+    public function testRejectsCoreConfigData(): void
+    {
+        // Encrypted gateway credentials live here; system.config.get is the redacting path.
+        $this->assertRejected('SELECT path, value FROM core_config_data', 'core_config_data');
+    }
+
+    // ---------------------------------------------------------------- allowlist: gate
+
+    public function testEmptyAllowlistRefusesEveryQuery(): void
+    {
+        $guard = $this->guard(100, 1000, []);
+
+        foreach (
+            [
+                'SELECT 1',
+                'SELECT entity_id FROM customer_entity',
+                'SHOW TABLES',
+                'DESCRIBE customer_entity',
+                'EXPLAIN SELECT entity_id FROM customer_entity',
+            ] as $sql
+        ) {
+            $this->assertRejectedBy($guard, $sql, 'allowed_tables');
+        }
+    }
+
+    public function testCommentOnlyAllowlistCountsAsEmpty(): void
+    {
+        // What DbToolsConfig hands over for the shipped default field value.
+        $this->assertRejectedBy($this->guard(100, 1000, []), 'SELECT 1', 'no table');
+    }
+
+    public function testTablelessSelectIsAcceptedOnceTheAllowlistIsConfigured(): void
+    {
+        $this->assertSame('SELECT 1 LIMIT 100', $this->guard()->assertReadOnly('SELECT 1'));
+    }
+
+    public function testRejectsProtectedNameListedInTheAllowlistConfig(): void
+    {
+        // Naming the offending entry: the operator must not be left guessing which line is wrong.
+        $guard = $this->guard(100, 1000, ['customer_entity', 'admin_user']);
+        $this->assertRejectedBy($guard, 'SELECT entity_id FROM customer_entity', 'admin_user');
+        $this->assertRejectedBy($guard, 'SELECT entity_id FROM customer_entity', 'allowed_tables');
+    }
+
+    public function testRejectsPrefixSpelledProtectedNameListedInTheAllowlistConfig(): void
+    {
+        $guard = $this->guard(100, 1000, ['customer_entity', 'm2_admin_user'], [], 'm2_');
+        $this->assertRejectedBy($guard, 'SELECT entity_id FROM m2_customer_entity', 'm2_admin_user');
+    }
+
+    public function testRejectsAllowlistEntryThatIsNotAPlainTableName(): void
+    {
+        foreach (['information_schema.tables', 'customer_%', 'two words'] as $entry) {
+            $guard = $this->guard(100, 1000, ['customer_entity', $entry]);
+            $this->assertRejectedBy($guard, 'SELECT entity_id FROM customer_entity', $entry);
+        }
+    }
+
+    // ---------------------------------------------------------------- allowlist: table positions
+
+    public function testRejectsTableThatIsNotAllowlisted(): void
+    {
+        $this->assertRejected('SELECT a FROM cataloginventory_stock_item', 'cataloginventory_stock_item');
+        $this->assertRejected('SELECT a FROM cataloginventory_stock_item', 'allowed_tables');
+    }
+
+    /**
+     * @return array<string, array{string, string}>
+     */
+    public static function unlistedTablePositionProvider(): array
+    {
+        return [
+            'from' => ['SELECT a FROM unlisted_ledger', 'unlisted_ledger'],
+            'subquery' => [
+                'SELECT entity_id FROM customer_entity WHERE entity_id IN (SELECT id FROM unlisted_ledger)',
+                'unlisted_ledger',
+            ],
+            'join' => [
+                'SELECT c.entity_id FROM customer_entity c JOIN unlisted_ledger s ON s.id = c.entity_id',
+                'unlisted_ledger',
+            ],
+            'left join' => [
+                'SELECT c.entity_id FROM customer_entity c LEFT JOIN unlisted_ledger AS s ON s.id = c.entity_id',
+                'unlisted_ledger',
+            ],
+            'comma join' => ['SELECT a FROM customer_entity, unlisted_ledger', 'unlisted_ledger'],
+            'cte body' => [
+                'WITH c AS (SELECT id FROM unlisted_ledger) SELECT id FROM c',
+                'unlisted_ledger',
+            ],
+            'second cte body' => [
+                'WITH a AS (SELECT 1 AS n), b AS (SELECT id FROM unlisted_ledger) SELECT n FROM a',
+                'unlisted_ledger',
+            ],
+            'derived table' => ['SELECT d.id FROM (SELECT id FROM unlisted_ledger) d', 'unlisted_ledger'],
+            // MariaDB accepts a bare parenthesised table reference: `FROM (t)` reads table t.
+            'parenthesised table reference' => ['SELECT a FROM (unlisted_ledger)', 'unlisted_ledger'],
+            'parenthesised join' => [
+                'SELECT a FROM (customer_entity c JOIN unlisted_ledger s ON s.id = c.entity_id)',
+                'unlisted_ledger',
+            ],
+            'union branch' => [
+                'SELECT entity_id FROM customer_entity UNION SELECT id FROM unlisted_ledger',
+                'unlisted_ledger',
+            ],
+            'union after window clause' => [
+                'SELECT entity_id FROM customer_entity WINDOW w AS () UNION SELECT id FROM unlisted_ledger',
+                'unlisted_ledger',
+            ],
+            'straight_join' => ['SELECT a FROM customer_entity STRAIGHT_JOIN unlisted_ledger', 'unlisted_ledger'],
+            'backtick quoted' => ['SELECT a FROM `unlisted_ledger`', 'unlisted_ledger'],
+            'quoted keyword name' => ['SELECT a FROM `select`', '`select`'],
+            'exists subquery' => [
+                'SELECT entity_id FROM customer_entity WHERE EXISTS (SELECT 1 FROM unlisted_ledger)',
+                'unlisted_ledger',
+            ],
+            'nested subquery' => [
+                'SELECT a FROM (SELECT b FROM (SELECT id AS b FROM unlisted_ledger) inner_alias) outer_alias',
+                'unlisted_ledger',
+            ],
+            'doubly parenthesised table reference' => ['SELECT a FROM ((unlisted_ledger))', 'unlisted_ledger'],
+            'natural join' => ['SELECT a FROM customer_entity NATURAL JOIN unlisted_ledger', 'unlisted_ledger'],
+            'left outer join' => [
+                'SELECT a FROM customer_entity LEFT OUTER JOIN unlisted_ledger u ON u.id = 1',
+                'unlisted_ledger',
+            ],
+            'comma after a derived table' => [
+                'SELECT a FROM (SELECT entity_id, firstname FROM customer_entity) d, unlisted_ledger',
+                'unlisted_ledger',
+            ],
+            'derived table after a comma' => [
+                'SELECT a FROM customer_entity, (SELECT id FROM unlisted_ledger) d',
+                'unlisted_ledger',
+            ],
+            'union all branch' => [
+                'SELECT entity_id FROM customer_entity UNION ALL SELECT id FROM unlisted_ledger',
+                'unlisted_ledger',
+            ],
+            'aliased to an allowlisted name' => ['SELECT a FROM unlisted_ledger AS t', 'unlisted_ledger'],
+            'comment between FROM and the table' => ['SELECT a FROM/**/unlisted_ledger', 'unlisted_ledger'],
+            'lower case clause keywords' => ['select a from unlisted_ledger', 'unlisted_ledger'],
+            'explain for connection' => ['EXPLAIN FOR CONNECTION 5', 'for'],
+            'quoted describe target' => ['DESCRIBE `unlisted_ledger`', 'unlisted_ledger'],
+            'parenthesised comma list' => [
+                'SELECT a FROM (customer_entity, unlisted_ledger)',
+                'unlisted_ledger',
+            ],
+            'join onto a parenthesised list' => [
+                'SELECT a FROM customer_entity JOIN (sales_order, unlisted_ledger)',
+                'unlisted_ledger',
+            ],
+            'comma after a cte reference' => [
+                'WITH c AS (SELECT 1 AS a) SELECT a FROM c, unlisted_ledger',
+                'unlisted_ledger',
+            ],
+            'scalar subquery in the select list' => [
+                'SELECT (SELECT MAX(id) FROM unlisted_ledger) AS m FROM customer_entity',
+                'unlisted_ledger',
+            ],
+            'scalar subquery in the where clause' => [
+                'SELECT entity_id FROM customer_entity WHERE entity_id = (SELECT MAX(id) FROM unlisted_ledger)',
+                'unlisted_ledger',
+            ],
+            'having subquery' => [
+                'SELECT store_id FROM sales_order GROUP BY store_id '
+                . 'HAVING COUNT(*) > (SELECT MAX(id) FROM unlisted_ledger)',
+                'unlisted_ledger',
+            ],
+            'order by subquery' => [
+                'SELECT entity_id FROM customer_entity ORDER BY (SELECT MAX(id) FROM unlisted_ledger)',
+                'unlisted_ledger',
+            ],
+        ];
+    }
+
+    /**
+     * @dataProvider unlistedTablePositionProvider
+     * @param string $sql
+     * @param string $table
+     * @return void
+     */
+    public function testRejectsUnlistedTableInEveryTablePosition(string $sql, string $table): void
+    {
+        $this->assertRejected($sql, $table);
+    }
+
+    public function testRejectsBaseTableUsedOutsideTheScopeOfASameNamedNestedCte(): void
+    {
+        // Probed on MariaDB 10.6: a WITH inside a derived table is scoped to that derived table,
+        // so the outer reference reads the *base* table. A statement-wide CTE exemption would
+        // hand over any table an attacker names in a nested WITH.
+        $this->assertRejected(
+            'SELECT d.a, s.id FROM (WITH unlisted_ledger AS (SELECT 1 AS a) SELECT a FROM unlisted_ledger) d, '
+            . 'unlisted_ledger s',
+            'unlisted_ledger'
+        );
+    }
+
+    public function testRejectsUnlistedDescribeTarget(): void
+    {
+        $this->assertRejected('DESCRIBE unlisted_ledger', 'unlisted_ledger');
+        $this->assertRejected('DESC unlisted_ledger', 'unlisted_ledger');
+        $this->assertRejected('EXPLAIN unlisted_ledger', 'unlisted_ledger');
+    }
+
+    public function testRejectsUnlistedTableInExplainedSelect(): void
+    {
+        $this->assertRejected('EXPLAIN SELECT id FROM unlisted_ledger', 'unlisted_ledger');
+        $this->assertRejected('EXPLAIN FORMAT = JSON SELECT id FROM unlisted_ledger', 'unlisted_ledger');
+    }
+
+    public function testAcceptsAllowlistedDescribeTarget(): void
+    {
+        $this->assertSame('DESCRIBE customer_entity', $this->guard()->assertReadOnly('DESCRIBE customer_entity'));
+    }
+
+    // ------------------------------------------------ allowlist: exact + prefix matching only
+
+    public function testAllowlistEntryDoesNotAdmitASuffixedTable(): void
+    {
+        // The fail-open direction of the old word-run matcher.
+        $guard = $this->guard(100, 1000, ['customer_entity']);
+        $this->assertRejectedBy($guard, 'SELECT a FROM customer_entity_backup', 'customer_entity_backup');
+    }
+
+    public function testAllowlistEntryDoesNotAdmitAnIdentifierThatMerelyContainsIt(): void
+    {
+        $guard = $this->guard(100, 1000, ['user', 'order', 'entity']);
+        $this->assertRejectedBy($guard, 'SELECT a FROM sales_order', 'sales_order');
+        $this->assertRejectedBy($guard, 'SELECT a FROM customer_entity', 'customer_entity');
+        // The brief's own example: an allowed bare `user` must never admit `admin_user`.
+        $this->assertRejectedBy($guard, 'SELECT a FROM admin_user', 'admin_user');
+    }
+
+    public function testAllowlistEntryDoesNotAdmitAPrefixedTableWhenNoPrefixIsConfigured(): void
+    {
+        $guard = $this->guard(100, 1000, ['customer_entity']);
+        $this->assertRejectedBy($guard, 'SELECT a FROM m2_customer_entity', 'm2_customer_entity');
+    }
+
+    public function testPrefixedInstallMatchesAnUnprefixedAllowlistEntry(): void
+    {
+        $guard = $this->guard(100, 1000, ['catalog_product_entity'], [], 'm2_');
+        $this->assertSame(
+            'SELECT entity_id FROM m2_catalog_product_entity LIMIT 100',
+            $guard->assertReadOnly('SELECT entity_id FROM m2_catalog_product_entity')
+        );
+    }
+
+    public function testUnprefixedTableStillMatchesWhenAPrefixIsConfigured(): void
+    {
+        $guard = $this->guard(100, 1000, ['catalog_product_entity'], [], 'm2_');
+        $this->assertSame(
+            'SELECT entity_id FROM catalog_product_entity LIMIT 100',
+            $guard->assertReadOnly('SELECT entity_id FROM catalog_product_entity')
+        );
+    }
+
+    public function testAllowlistMatchingIsCaseInsensitive(): void
+    {
+        $this->assertSame(
+            'SELECT entity_id FROM CUSTOMER_ENTITY LIMIT 100',
+            $this->guard()->assertReadOnly('SELECT entity_id FROM CUSTOMER_ENTITY')
+        );
+    }
+
+    public function testBacktickQuotedAllowlistedTableIsAccepted(): void
+    {
+        $this->assertSame(
+            'SELECT entity_id FROM `customer_entity` LIMIT 100',
+            $this->guard()->assertReadOnly('SELECT entity_id FROM `customer_entity`')
+        );
+    }
+
+    // ------------------------------------------------ allowlist: schema-qualified references
+
+    public function testAcceptsCurrentDatabaseQualifiedTable(): void
+    {
+        $this->assertSame(
+            'SELECT entity_id FROM magento.customer_entity LIMIT 100',
+            $this->guard()->assertReadOnly('SELECT entity_id FROM magento.customer_entity')
+        );
+    }
+
+    public function testRejectsTableQualifiedWithAnotherDatabase(): void
+    {
+        $this->assertRejected('SELECT entity_id FROM other_db.customer_entity', 'other_db');
+    }
+
+    public function testRejectsUnlistedTableQualifiedWithTheCurrentDatabase(): void
+    {
+        $this->assertRejected('SELECT id FROM magento.unlisted_ledger', 'unlisted_ledger');
+    }
+
+    // ------------------------------------------------ allowlist: false-positive guards
+
+    /**
+     * @return array<string, array{string}>
+     */
+    public static function nonTableIdentifierProvider(): array
+    {
+        return [
+            'cte name' => ['WITH unlisted_ledger AS (SELECT 1 AS n) SELECT n FROM unlisted_ledger'],
+            'two cte names' => [
+                'WITH a AS (SELECT 1 AS n), b AS (SELECT 2 AS m) SELECT a.n, b.m FROM a, b',
+            ],
+            'recursive cte self reference' => [
+                'WITH RECURSIVE seq AS (SELECT 1 AS n UNION SELECT n + 1 FROM seq WHERE n < 5) SELECT n FROM seq',
+            ],
+            'cte used in a join' => [
+                'WITH c AS (SELECT entity_id FROM customer_entity) '
+                . 'SELECT c.entity_id FROM c JOIN sales_order o ON o.customer_id = c.entity_id',
+            ],
+            'derived table alias' => ['SELECT d.entity_id FROM (SELECT entity_id FROM customer_entity) d'],
+            'derived table alias with AS' => [
+                'SELECT d.entity_id FROM (SELECT entity_id FROM customer_entity) AS d',
+            ],
+            'table alias' => ['SELECT ce.entity_id FROM customer_entity ce'],
+            'table alias with AS' => ['SELECT ce.entity_id FROM customer_entity AS ce'],
+            'column alias' => ['SELECT entity_id AS unlisted_ledger FROM customer_entity'],
+            'select list commas' => ['SELECT entity_id, firstname, lastname FROM customer_entity'],
+            'group by and order by commas' => [
+                'SELECT store_id, state, COUNT(*) FROM sales_order GROUP BY store_id, state '
+                . 'ORDER BY store_id, state',
+            ],
+            'join using column list' => [
+                'SELECT o.entity_id FROM sales_order o JOIN sales_order_grid g USING (entity_id, store_id)',
+            ],
+            'window definition name' => [
+                'SELECT ROW_NUMBER() OVER w FROM sales_order WINDOW w AS (ORDER BY entity_id)',
+            ],
+            'index hint' => ['SELECT entity_id FROM customer_entity USE INDEX (PRIMARY) WHERE entity_id = 1'],
+            'dual' => ['SELECT 1 FROM DUAL'],
+            'straight_join select modifier' => ['SELECT STRAIGHT_JOIN entity_id FROM customer_entity'],
+            'cast precision list' => ['SELECT CAST(grand_total AS DECIMAL(12,4)) FROM sales_order'],
+            'in list of literals' => ['SELECT entity_id FROM customer_entity WHERE entity_id IN (1, 2, 3)'],
+            'quoted cte name' => ['WITH `c` AS (SELECT entity_id FROM customer_entity) SELECT entity_id FROM `c`'],
+            'cte referenced from a nested subquery' => [
+                'WITH c AS (SELECT entity_id FROM customer_entity) '
+                . 'SELECT entity_id FROM c WHERE entity_id IN (SELECT entity_id FROM c)',
+            ],
+            'two derived tables' => [
+                'SELECT d.entity_id, e.entity_id FROM (SELECT entity_id FROM customer_entity) d, '
+                . '(SELECT entity_id FROM sales_order) e',
+            ],
+            'partition clause' => ['SELECT entity_id FROM sales_order PARTITION (p0) WHERE store_id = 1'],
+            'union branch on an allowlisted table' => [
+                'SELECT entity_id FROM customer_entity UNION ALL SELECT entity_id FROM sales_order',
+            ],
+        ];
+    }
+
+    /**
+     * @dataProvider nonTableIdentifierProvider
+     * @param string $sql
+     * @return void
+     */
+    public function testAliasesAndCteNamesDoNotNeedAllowlisting(string $sql): void
+    {
+        $this->assertNotSame('', $this->guard()->assertReadOnly($sql));
+    }
+
+    // ------------------------------------------------ deny after allow
+
+    public function testProtectedTableIsRefusedEvenWhenAllowlisted(): void
+    {
+        $guard = $this->guard(100, 1000, ['customer_entity', 'admin_user']);
+        $this->assertRejectedBy($guard, 'SELECT email FROM admin_user', 'admin_user');
+        $this->assertRejectedBy($guard, 'SELECT email FROM admin_user', 'protected');
+    }
+
+    public function testProtectedNameIsRefusedInsideAnAllowlistedWrapperTable(): void
+    {
+        // `custom_admin_user_map` is a legal allowlist entry (it is not itself a protected name),
+        // so this is the pure ordering case: the allow check passes and the veto still refuses.
+        $guard = $this->guard(100, 1000, ['custom_admin_user_map']);
+        $this->assertRejectedBy($guard, 'SELECT a FROM custom_admin_user_map', 'admin_user');
+    }
+
+    public function testInformationSchemaViewsStayRefusedWhenTheSchemaIsAllowlisted(): void
+    {
+        $guard = $this->guard(100, 1000, ['customer_entity', 'information_schema']);
+
+        $this->assertRejectedBy($guard, 'SHOW PROCESSLIST', 'processlist');
+        $this->assertRejectedBy(
+            $guard,
+            'SELECT trx_id, trx_query FROM information_schema.innodb_trx',
+            'innodb_trx'
+        );
+        $this->assertRejectedBy(
+            $guard,
+            'SELECT grantee FROM information_schema.user_privileges',
+            'user_privileges'
+        );
+    }
+
+    public function testColumnDenyListStillFiresOnAnAllowlistedTable(): void
+    {
+        // A table allowlist cannot protect a secret column on a table any useful list contains.
+        $this->assertRejected('SELECT password_hash FROM customer_entity', 'password_hash');
+        $this->assertRejected('SELECT rp_token FROM customer_entity', 'rp_token');
+        $this->assertRejected('SELECT cc_last4 FROM sales_order_payment', 'cc_last4');
+    }
+
+    // ------------------------------------------------ SHOW forms
+
+    public function testAcceptsShowFormsWithAnAllowlistedTarget(): void
+    {
+        $guard = $this->guard();
+        $this->assertSame('SHOW TABLES', $guard->assertReadOnly('SHOW TABLES'));
+        $this->assertSame(
+            'SHOW FULL COLUMNS FROM customer_entity',
+            $guard->assertReadOnly('SHOW FULL COLUMNS FROM customer_entity')
+        );
+        $this->assertSame(
+            'SHOW INDEX FROM customer_entity',
+            $guard->assertReadOnly('SHOW INDEX FROM customer_entity')
+        );
+    }
+
+    public function testRejectsShowFormsTargetingAnUnlistedTable(): void
+    {
+        $this->assertRejected('SHOW COLUMNS FROM unlisted_ledger', 'unlisted_ledger');
+        $this->assertRejected('SHOW FULL COLUMNS FROM unlisted_ledger', 'unlisted_ledger');
+        $this->assertRejected('SHOW INDEX FROM unlisted_ledger', 'unlisted_ledger');
+        $this->assertRejected('SHOW KEYS IN unlisted_ledger', 'unlisted_ledger');
+    }
+
+    public function testRejectsShowFormsThatRevealOtherTables(): void
+    {
+        // TRIGGERS and EVENTS embed statement bodies; TABLE STATUS reports per-table row counts.
+        $this->assertRejected('SHOW TRIGGERS', 'SHOW');
+        $this->assertRejected('SHOW EVENTS', 'SHOW');
+        $this->assertRejected('SHOW TABLE STATUS', 'SHOW');
+        $this->assertRejected('SHOW OPEN TABLES', 'SHOW');
+        $this->assertRejected('SHOW FUNCTION STATUS', 'SHOW');
+    }
+
+    public function testRejectsShowTablesFromAProtectedSchema(): void
+    {
+        $this->assertRejected('SHOW TABLES FROM information_schema', 'information_schema');
+    }
+
+    // ------------------------------------------------ structural-keyword exemption
+
+    public function testRejectsLateralAsAFunctionName(): void
+    {
+        // Probed on MariaDB 10.6: `lateral` is non-reserved there, so it can name a stored
+        // function and must not carry the structural exemption.
+        $this->assertRejected('SELECT lateral(1)', 'not a permitted function');
     }
 }

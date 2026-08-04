@@ -13,4 +13,51 @@
         </arguments>
     </type>
 
+    <!--
+        Tables the read-only SQL tool may never touch, whatever the admin-configured allowlist
+        says. Deliberately declared here rather than as a class constant or a store-config field:
+        weakening this set needs filesystem write access plus `setup:di:compile`, so it is out of
+        reach of an admin-panel user, a stolen admin session, and the MCP surface itself — while a
+        project or satellite module can still add its own credential tables through a di.xml merge
+        without patching this module.
+
+        `protectedTables` is matched widely (exact, `<prefix><name>`, and as a contiguous run of
+        words inside a longer identifier), so a wrapper table such as `custom_admin_user_map` is
+        caught too. `protectedIdentifiers` is matched by strict equality only: those are
+        server-owned single words that wider matching would over-deny.
+    -->
+    <type name="Magebit\McpDbTools\Model\TableAccessPolicy">
+        <arguments>
+            <argument name="protectedTables" xsi:type="array">
+                <item name="admin_user" xsi:type="string">admin_user</item>
+                <item name="admin_passwords" xsi:type="string">admin_passwords</item>
+                <item name="admin_user_session" xsi:type="string">admin_user_session</item>
+                <item name="admin_user_expiration" xsi:type="string">admin_user_expiration</item>
+                <item name="oauth_token" xsi:type="string">oauth_token</item>
+                <item name="oauth_consumer" xsi:type="string">oauth_consumer</item>
+                <item name="oauth_token_request_log" xsi:type="string">oauth_token_request_log</item>
+                <item name="magebit_mcp_token" xsi:type="string">magebit_mcp_token</item>
+                <item name="magebit_mcp_oauth_client" xsi:type="string">magebit_mcp_oauth_client</item>
+                <item name="magebit_mcp_oauth_auth_code" xsi:type="string">magebit_mcp_oauth_auth_code</item>
+                <item name="magebit_mcp_oauth_refresh_token" xsi:type="string">magebit_mcp_oauth_refresh_token</item>
+                <item name="persistent_session" xsi:type="string">persistent_session</item>
+                <item name="password_reset_request_event" xsi:type="string">password_reset_request_event</item>
+                <!-- Encrypted payment-gateway credentials and API keys; system.config.get is the
+                     path that redacts them. -->
+                <item name="core_config_data" xsi:type="string">core_config_data</item>
+            </argument>
+            <argument name="protectedIdentifiers" xsi:type="array">
+                <!-- Server-owned schemas. `mysql.user` holds password hashes; the rest expose
+                     other sessions' SQL text and the server's grant tables. -->
+                <item name="mysql" xsi:type="string">mysql</item>
+                <item name="information_schema" xsi:type="string">information_schema</item>
+                <item name="performance_schema" xsi:type="string">performance_schema</item>
+                <item name="sys" xsi:type="string">sys</item>
+                <item name="processlist" xsi:type="string">processlist</item>
+                <item name="innodb_trx" xsi:type="string">innodb_trx</item>
+                <item name="user_privileges" xsi:type="string">user_privileges</item>
+            </argument>
+        </arguments>
+    </type>
+
 </config>

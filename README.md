@@ -13,6 +13,11 @@ because it is the highest-risk tool in the family:
 - **Read-only.** Only a single `SELECT` is accepted. Writes, DDL, multi-statement
   input, and statements with side effects are rejected before they reach the
   database.
+- **Allowlist-only.** The tool reads the tables an admin lists in **Allowed
+  Tables** and nothing else — and refuses every query, `SELECT 1` included, while
+  that list is empty. A protected set (admin accounts, tokens, sessions,
+  `core_config_data`, the server's own schemas) is declared in the module's
+  `etc/di.xml` and stays unreadable even if it is listed as allowed.
 - **Disabled by default.** Installing and enabling the module does nothing on its
   own — `magebit_mcp/db_tools/enabled` defaults to `0`. An admin must turn it on
   under Stores → Configuration → Magebit → MCP Server → **MCP Database Reader**.
@@ -48,9 +53,10 @@ Stores → Configuration → Magebit → MCP Server → **MCP Database Reader**
 | Default Row Limit | `100` | Row cap when a call does not request one. |
 | Maximum Row Limit | `1000` | Hard ceiling a call can never exceed. |
 | Statement Timeout (seconds) | `10` | Server-side time budget per query. |
-| Additional Denied Tables | *(empty)* | Extra tables to block, one per line; `#` lines ignored. |
+| Allowed Tables | *(empty)* | **The only tables the tool may read**, one per line; `#` lines ignored. Empty refuses every query. |
+| Additional Denied Tables | *(empty)* | Extra tables to protect on top of the allowlist, one per line. |
 
 ## Security documentation
 
-Full threat model, the built-in table deny-list, the SQL grammar that is accepted,
-and operator guidance are documented separately once the tool ships.
+Full threat model, the protected set, the SQL grammar that is accepted, and
+operator guidance are documented separately once the tool ships.

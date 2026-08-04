@@ -15,7 +15,7 @@ use Magento\Framework\Exception\LocalizedException;
  * Validates that an operator-supplied statement is a single, read-only, bounded query and
  * returns the exact SQL the caller must execute — so what was validated is what runs.
  *
- * Eight layers, in order, each with its own rejection message:
+ * The layers below run in this order, each with its own rejection message:
  *
  * 1. **Lexing + comment stripping.** The statement is scanned byte by byte into tokens
  *    (words, string literals, numbers, punctuation) while comments are replaced by a single
@@ -39,9 +39,23 @@ use Magento\Framework\Exception\LocalizedException;
  * 4b. **Function allowlist.** Every `name(` must be a built-in read-only function. A deny-list
  *    cannot stop a stored function or UDF that mutates data, because the operator chooses the
  *    name; only an allowlist can.
- * 5. **Table deny-list** — see {@see DenyList}. Scanned over every identifier in the
- *    statement, including subqueries and joins; no clause-aware parsing is attempted.
- * 6. **Column deny-list** — same scan, secret-bearing column names.
+ * 5. **Protected identifiers** — see {@see TableAccessPolicy}. Scanned over *every* identifier
+ *    in the statement, not only the ones in table positions: this is the layer the crown jewels
+ *    depend on, so it must not rest on the positional parser used by layer 5b. It also runs
+ *    *first*, so its message wins over "not allowed" for a name that is both.
+ * 5b. **Table allowlist** — `magebit_mcp/db_tools/allowed_tables`, empty by default; an empty
+ *    list refuses every statement, `SELECT 1` included. Only identifiers in **table positions**
+ *    have to be listed (see {@see assertTablesAreAllowlisted()}), so CTE names and aliases need
+ *    no entry, and matching is exact-or-prefixed only — never the wide word-run matcher, which
+ *    fails open in the allow direction. Running after layer 5 is what stops an allowlist entry
+ *    from re-opening a protected name.
+ * 5c. **SHOW form allowlist** — `SHOW` sub-forms that expose tables the allowlist never named
+ *    (`TRIGGERS`, `EVENTS`, `TABLE STATUS`, `ENGINE INNODB STATUS`, …) are refused outright;
+ *    the forms that do take a table target go through layer 5b like any other table position.
+ * 6. **Column deny-list** — secret-bearing column names, scanned over every identifier and kept
+ *    independent of table resolution: a table allowlist cannot protect
+ *    `customer_entity.password_hash` or `sales_order_payment.cc_*`, which sit on tables any
+ *    useful allowlist contains.
  * 7. **No wildcards.** `SELECT *` / `t.*` would return secret columns that layer 6 cannot
  *    see, so an explicit column list is required. `COUNT(*)` is the one accepted `*` shape.
  * 8. **Row limit.** SELECT/WITH get `LIMIT <default>` appended when they carry none; a
@@ -143,27 +157,72 @@ class QueryGuard
      * subqueries, `IN (…)`, `WITH x AS (…)`, `OVER (…)`, and so on. Only consulted for
      * unquoted words: a backtick-quoted word before `(` is always a function call.
      *
-     * Every entry is a *reserved* word in MySQL 8, so none of them can be the unquoted name
-     * of a stored function. That is why `ANY` and `AGAINST` are absent despite being valid
-     * before `(` — they are non-reserved, so exempting them would let `any(1)` call a stored
-     * function. The cost is that `= ANY (subquery)` and fulltext `MATCH … AGAINST (…)` are
-     * unsupported; `IN (subquery)` and `LIKE` cover the realistic cases.
+     * The invariant every entry must satisfy: it can never be the unquoted name of a stored
+     * function **in any supported server, MariaDB included**. "Reserved in MySQL 8" is the wrong
+     * test for a Magento module and is exactly how `ANY`, `AGAINST` and `LATERAL` got in here.
+     * Verified on MariaDB 10.6 with `SELECT <word>(1)`: every entry either fails to parse
+     * (reserved) or parses as an operator / select modifier (`NOT`, `ALL`, `DISTINCT`,
+     * `STRAIGHT_JOIN`), so none of them can reach a stored function.
+     *
+     * `LATERAL` was removed for failing that test: MariaDB 10.6 answers `SELECT lateral(1)` with
+     * *FUNCTION … does not exist*, i.e. it is non-reserved there (as in MySQL 8.0.0–8.0.13) and
+     * can name a stored function. MariaDB 10.6 has no lateral derived tables anyway. `ANY` and
+     * `AGAINST` are absent for the same reason, at the cost of `= ANY (subquery)` and fulltext
+     * `MATCH … AGAINST (…)`; `IN (subquery)` and `LIKE` cover the realistic cases.
      */
     private const STRUCTURAL_KEYWORDS = [
         'SELECT', 'FROM', 'WHERE', 'HAVING', 'GROUP', 'ORDER', 'BY', 'AND', 'OR', 'XOR', 'NOT', 'IN',
-        'EXISTS', 'AS', 'ON', 'USING', 'JOIN', 'INNER', 'CROSS', 'NATURAL', 'STRAIGHT_JOIN', 'LATERAL',
+        'EXISTS', 'AS', 'ON', 'USING', 'JOIN', 'INNER', 'CROSS', 'NATURAL', 'STRAIGHT_JOIN',
         'UNION', 'EXCEPT', 'INTERSECT', 'ALL', 'SOME', 'DISTINCT', 'CASE', 'WHEN', 'THEN', 'ELSE',
         'IS', 'LIKE', 'RLIKE', 'REGEXP', 'BETWEEN', 'OVER', 'PARTITION', 'MATCH', 'INDEX',
         'KEY', 'INTERVAL', 'ROW', 'VALUES', 'WITH', 'RECURSIVE',
     ];
 
     /**
+     * `SHOW` sub-forms that are accepted: either they name a table (which then goes through the
+     * table allowlist) or they expose nothing table-specific. Everything else is refused,
+     * including `TRIGGERS` / `EVENTS` (they embed statement bodies), `TABLE STATUS` and
+     * `OPEN TABLES` (per-table row counts and names) and `ENGINE INNODB STATUS` (other sessions'
+     * SQL). `SHOW CREATE …` and `SHOW GRANTS` never get this far — layer 4 denies those keywords.
+     */
+    private const ALLOWED_SHOW_FORMS = [
+        'TABLES', 'COLUMNS', 'FIELDS', 'INDEX', 'INDEXES', 'KEYS', 'DATABASES', 'SCHEMAS', 'ENGINES',
+        'CHARACTER', 'CHARSET', 'COLLATION', 'VARIABLES', 'STATUS', 'WARNINGS', 'ERRORS',
+    ];
+
+    /**
+     * Words that may sit between `SHOW` and the sub-form itself.
+     */
+    private const SHOW_FORM_MODIFIERS = ['FULL', 'EXTENDED', 'GLOBAL', 'SESSION'];
+
+    /**
+     * Keywords that end a `FROM`/`JOIN` table list, after which a top-level comma separates
+     * expressions (`GROUP BY a, b`) rather than another table reference.
+     */
+    private const TABLE_LIST_TERMINATORS = [
+        'WHERE', 'GROUP', 'HAVING', 'ORDER', 'LIMIT', 'OFFSET', 'WINDOW', 'UNION', 'EXCEPT', 'INTERSECT',
+        'INTO', 'PROCEDURE', 'FOR', 'SET', 'LIKE',
+    ];
+
+    /**
+     * The only words that may stand where a table name is expected without being one. Kept this
+     * short on purpose: everything else in a table position is treated as a table name and has to
+     * be allowlisted, so an unforeseen construct fails closed. `SELECT`/`WITH` open a derived
+     * table or CTE and `DUAL` is the dummy one-row table; all three are reserved in MySQL and
+     * MariaDB, so a real table with one of those names cannot be referenced unquoted — and a
+     * quoted identifier is always checked.
+     */
+    private const NON_TABLE_WORDS = ['SELECT', 'WITH', 'DUAL'];
+
+    /**
      * @param DbToolsConfig $config
-     * @param DenyList $denyList
+     * @param TableAccessPolicy $tablePolicy
+     * @param ColumnDenyList $columnDenyList
      */
     public function __construct(
         private readonly DbToolsConfig $config,
-        private readonly DenyList $denyList
+        private readonly TableAccessPolicy $tablePolicy,
+        private readonly ColumnDenyList $columnDenyList
     ) {
     }
 
@@ -186,7 +245,13 @@ class QueryGuard
         $leadingKeyword = $this->assertAllowedLeadingKeyword($tokens);
         $this->assertNoDeniedKeywords($tokens);
         $this->assertOnlyAllowedFunctions($tokens);
-        $this->assertNoDeniedTables($tokens);
+        // Layer 5 before 5b/5c, and never instead of them: the protected set vetoes the allowlist.
+        $this->assertNoProtectedIdentifiers($tokens);
+        $this->tablePolicy->assertUsableAllowlist();
+        if ($leadingKeyword === 'SHOW') {
+            $this->assertAllowedShowForm($tokens);
+        }
+        $this->assertTablesAreAllowlisted($tokens, $leadingKeyword);
         $this->assertNoDeniedColumns($tokens);
 
         if (in_array($leadingKeyword, self::METADATA_KEYWORDS, true)) {
@@ -602,28 +667,329 @@ class QueryGuard
         }
     }
 
-    // ------------------------------------------------------------------ layers 5 and 6: identifiers
+    // ------------------------------------------------------------------ layer 5: protected veto
 
     /**
+     * The protected set, applied to every identifier in the statement rather than only to table
+     * positions. Wider than strictly necessary — a column named `admin_user_id` is refused too —
+     * and deliberately so: this is the layer that must keep holding if the positional scan in
+     * {@see assertTablesAreAllowlisted()} ever misreads a construct.
+     *
      * @param list<SqlToken> $tokens
      * @return void
      * @throws LocalizedException
      */
-    private function assertNoDeniedTables(array $tokens): void
+    private function assertNoProtectedIdentifiers(array $tokens): void
     {
-        foreach ($tokens as $token) {
-            if ($token['type'] !== self::TYPE_WORD) {
-                continue;
-            }
-
-            $denied = $this->denyList->findDeniedTable($token['value']);
-            if ($denied !== null) {
+        foreach ($this->identifierScanOrder($tokens) as $identifier) {
+            $protected = $this->tablePolicy->findProtectedIdentifier($identifier);
+            if ($protected !== null) {
                 throw new LocalizedException(
-                    __('The table `%1` is protected and cannot be queried.', $denied)
+                    __('The table `%1` is protected and cannot be queried.', $protected)
                 );
             }
         }
     }
+
+    /**
+     * Identifier values in the order they are checked: for a qualified `schema.name`, the name
+     * part comes first, so `information_schema.innodb_trx` is refused as `innodb_trx` — the view
+     * that is actually the problem — rather than as its schema.
+     *
+     * @param list<SqlToken> $tokens
+     * @return list<string>
+     */
+    private function identifierScanOrder(array $tokens): array
+    {
+        $identifiers = [];
+        $count = count($tokens);
+
+        for ($index = 0; $index < $count; $index++) {
+            if ($tokens[$index]['type'] !== self::TYPE_WORD) {
+                continue;
+            }
+
+            $qualified = $this->readQualifier($tokens, $index);
+            if ($qualified !== null) {
+                $identifiers[] = $qualified;
+                $identifiers[] = $tokens[$index]['value'];
+                $index += 2;
+                continue;
+            }
+
+            $identifiers[] = $tokens[$index]['value'];
+        }
+
+        return $identifiers;
+    }
+
+    /**
+     * @param list<SqlToken> $tokens
+     * @param int $index Index of the word that may be a schema qualifier.
+     * @return string|null The qualified name following `<word>.`, or null when there is none.
+     */
+    private function readQualifier(array $tokens, int $index): ?string
+    {
+        $separator = $tokens[$index + 1] ?? null;
+        $qualified = $tokens[$index + 2] ?? null;
+
+        if (
+            $separator !== null && $separator['type'] === self::TYPE_PUNCT && $separator['value'] === '.'
+            && $qualified !== null && $qualified['type'] === self::TYPE_WORD
+        ) {
+            return $qualified['value'];
+        }
+
+        return null;
+    }
+
+    // ------------------------------------------------------------------ layer 5b: table allowlist
+
+    /**
+     * Requires every identifier in a **table position** to be allowlisted. Table positions are
+     * the ones a table reference can occupy in the accepted grammar: after `FROM`, after any
+     * `JOIN`, after a comma that continues a table list, after `IN` in a `SHOW` statement, as the
+     * target of `DESCRIBE`/`DESC`/`EXPLAIN`, and inside parentheses that themselves stand in a
+     * table position — MariaDB reads `FROM (t)` as a plain read of `t`, so the expectation travels
+     * into the parentheses.
+     *
+     * Everything else is left alone, which is what keeps table aliases, derived-table aliases and
+     * column aliases out of the allowlist. CTE names are exempt as well, but only inside the scope
+     * that defines them: a `WITH` inside a derived table is scoped to that derived table, so
+     * remembering CTE names statement-wide would let a nested `WITH secret AS (…)` exempt a
+     * reference to the real `secret` table outside it.
+     *
+     * @param non-empty-list<SqlToken> $tokens
+     * @param string $leadingKeyword
+     * @return void
+     * @throws LocalizedException
+     */
+    private function assertTablesAreAllowlisted(array $tokens, string $leadingKeyword): void
+    {
+        $scopes = [new TableScanScope(false, false)];
+        $isShow = $leadingKeyword === 'SHOW';
+        $count = count($tokens);
+
+        for ($index = 0; $index < $count; $index++) {
+            $token = $tokens[$index];
+            $scope = $scopes[count($scopes) - 1];
+
+            if ($token['type'] === self::TYPE_PUNCT) {
+                if ($token['value'] === '(') {
+                    // A parenthesis standing in a table position is either a derived table or a
+                    // parenthesised table reference — MariaDB reads `FROM (t)` as a read of `t` —
+                    // so the expectation has to travel inside.
+                    $scopes[] = new TableScanScope($scope->expectTable, $scope->expectTable);
+                    $scope->expectTable = false;
+                    continue;
+                }
+                if ($token['value'] === ')') {
+                    if (count($scopes) > 1) {
+                        array_pop($scopes);
+                    }
+                    continue;
+                }
+                $scope->expectTable = $token['value'] === ',' && $scope->inTableList;
+                continue;
+            }
+
+            if ($token['type'] !== self::TYPE_WORD) {
+                $scope->expectTable = false;
+                continue;
+            }
+
+            $keyword = strtoupper($token['value']);
+
+            if ($scope->expectTable) {
+                if ($token['quoted'] || !$this->isNonTableWord($keyword, $tokens, $index, $leadingKeyword)) {
+                    $index = $this->assertTableReferenceAllowed($tokens, $index, $scopes);
+                    $scope->expectTable = false;
+                    continue;
+                }
+                $scope->expectTable = false;
+            }
+
+            // A quoted CTE name is still a CTE name: what makes the exemption safe is the WITH
+            // position and the scope, not the quoting.
+            if ($scope->inWithList && $this->definesCommonTableExpression($tokens, $index)) {
+                $scope->defineCommonTableExpression($token['value']);
+                continue;
+            }
+
+            if ($token['quoted']) {
+                continue;
+            }
+
+            switch ($keyword) {
+                case 'WITH':
+                    $scope->inWithList = true;
+                    break;
+                case 'SELECT':
+                    // The statement's own query begins: the WITH list, if any, is over.
+                    $scope->inWithList = false;
+                    $scope->inTableList = false;
+                    break;
+                case 'DESCRIBE':
+                case 'DESC':
+                case 'EXPLAIN':
+                    if ($index === 0) {
+                        $scope->expectTable = true;
+                    }
+                    break;
+                case 'FROM':
+                case 'JOIN':
+                    $scope->expectTable = true;
+                    $scope->inTableList = true;
+                    break;
+                case 'STRAIGHT_JOIN':
+                    // Also a SELECT modifier (`SELECT STRAIGHT_JOIN col …`), where no table follows.
+                    if (strtoupper($tokens[$index - 1]['value'] ?? '') !== 'SELECT') {
+                        $scope->expectTable = true;
+                        $scope->inTableList = true;
+                    }
+                    break;
+                case 'IN':
+                    // `SHOW COLUMNS IN <table>`; elsewhere `IN` introduces a value list.
+                    $scope->expectTable = $isShow;
+                    break;
+                default:
+                    if (in_array($keyword, self::TABLE_LIST_TERMINATORS, true)) {
+                        $scope->inTableList = false;
+                    }
+            }
+        }
+    }
+
+    /**
+     * @param string $keyword
+     * @param list<SqlToken> $tokens
+     * @param int $index
+     * @param string $leadingKeyword
+     * @return bool
+     */
+    private function isNonTableWord(string $keyword, array $tokens, int $index, string $leadingKeyword): bool
+    {
+        if (in_array($keyword, self::NON_TABLE_WORDS, true)) {
+            return true;
+        }
+
+        // `EXPLAIN FORMAT = JSON SELECT …` and nothing else: `format` is non-reserved, so anywhere
+        // but right here it could be a real table name.
+        return $keyword === 'FORMAT'
+            && $leadingKeyword === 'EXPLAIN'
+            && $index === 1
+            && ($tokens[$index + 1]['value'] ?? '') === '=';
+    }
+
+    /**
+     * Whether the word at $index is a CTE name — `<name> AS (`. Only ever consulted inside a
+     * `WITH` list, so a window definition (`WINDOW w AS (…)`) is not mistaken for one: window
+     * names are not table names, and a statement-wide `x AS (` rule would exempt whatever an
+     * attacker put there from the allowlist.
+     *
+     * @param list<SqlToken> $tokens
+     * @param int $index
+     * @return bool
+     */
+    private function definesCommonTableExpression(array $tokens, int $index): bool
+    {
+        $as = $tokens[$index + 1] ?? null;
+        $body = $tokens[$index + 2] ?? null;
+
+        return $as !== null && $as['type'] === self::TYPE_WORD && strtoupper($as['value']) === 'AS'
+            && $body !== null && $body['type'] === self::TYPE_PUNCT && $body['value'] === '(';
+    }
+
+    /**
+     * @param list<SqlToken> $tokens
+     * @param int $index Index of the first word of the table reference.
+     * @param non-empty-list<TableScanScope> $scopes Innermost scope last.
+     * @return int Index of the last token consumed by the reference.
+     * @throws LocalizedException
+     */
+    private function assertTableReferenceAllowed(array $tokens, int $index, array $scopes): int
+    {
+        $name = $tokens[$index]['value'];
+        $schema = null;
+        $qualified = $this->readQualifier($tokens, $index);
+
+        if ($qualified !== null) {
+            $schema = $name;
+            $name = $qualified;
+            $index += 2;
+        }
+
+        if ($schema !== null && !$this->tablePolicy->isCurrentDatabase($schema)) {
+            throw new LocalizedException(
+                __(
+                    'The reference `%1.%2` names another database. Only tables in this store\'s own '
+                    . 'database can be read.',
+                    $schema,
+                    $name
+                )
+            );
+        }
+
+        if ($schema === null) {
+            foreach ($scopes as $scope) {
+                if ($scope->hasCommonTableExpression($name)) {
+                    return $index;
+                }
+            }
+        }
+
+        if (!$this->tablePolicy->isAllowed($name)) {
+            throw new LocalizedException(
+                __(
+                    'The table `%1` is not in the Allowed Tables list, so it cannot be read. Add it under '
+                    . 'Stores > Configuration > Magebit > MCP Server > MCP Database Reader > Allowed Tables '
+                    . '(%2) if this tool should be able to read it.',
+                    $name,
+                    DbToolsConfig::XML_PATH_ALLOWED_TABLES
+                )
+            );
+        }
+
+        return $index;
+    }
+
+    // ------------------------------------------------------------------ layer 5c: SHOW forms
+
+    /**
+     * @param non-empty-list<SqlToken> $tokens
+     * @return void
+     * @throws LocalizedException
+     */
+    private function assertAllowedShowForm(array $tokens): void
+    {
+        $index = 1;
+        while (
+            ($tokens[$index] ?? null) !== null
+            && $tokens[$index]['type'] === self::TYPE_WORD
+            && !$tokens[$index]['quoted']
+            && in_array(strtoupper($tokens[$index]['value']), self::SHOW_FORM_MODIFIERS, true)
+        ) {
+            $index++;
+        }
+
+        $form = $tokens[$index] ?? null;
+        $name = $form !== null && $form['type'] === self::TYPE_WORD && !$form['quoted']
+            ? strtoupper($form['value'])
+            : '';
+
+        if (!in_array($name, self::ALLOWED_SHOW_FORMS, true)) {
+            throw new LocalizedException(
+                __(
+                    '`SHOW %1` is not accepted, because it can expose tables that are not in the Allowed '
+                    . 'Tables list. Accepted forms are: %2.',
+                    $form['value'] ?? '',
+                    implode(', ', self::ALLOWED_SHOW_FORMS)
+                )
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------ layer 6: column deny-list
 
     /**
      * @param list<SqlToken> $tokens
@@ -637,7 +1003,7 @@ class QueryGuard
                 continue;
             }
 
-            $denied = $this->denyList->findDeniedColumn($token['value']);
+            $denied = $this->columnDenyList->findDeniedColumn($token['value']);
             if ($denied !== null) {
                 throw new LocalizedException(
                     __(
