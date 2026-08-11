@@ -2,16 +2,44 @@
 
 A sub-module for the [Magento2 MCP module](https://github.com/magebitcom/magento2-mcp-module).
 
-Read-only SQL access over MCP. Ships one tool, `db.query`, which runs a single guarded `SELECT`
-against this store's database and returns the rows as JSON.
+Ships one tool, `db.query`, which runs a single guarded read-only `SELECT` against this store's
+database and returns the rows as JSON.
 
-This module is published separately from the other MCP satellites for one reason: it is the
-highest-risk tool in the family. Everything below is written for the person deciding whether to
-turn it on, and what to let it see.
+---
 
-**Read this before enabling it.** A read-only query is still a data-extraction capability. The
-guards in this module bound the *shape* of a query and the *tables* it may name; they cannot make
-the data behind those tables less sensitive.
+## ⚠️ Read this before you enable it
+
+**This module hands an MCP client bulk read access to your production database. Use it at your own
+risk.**
+
+- A read-only query is still **data extraction**. The guard bounds the *shape* of a query and the
+  *tables* it may name. It cannot make the data behind those tables less sensitive.
+- **Any table an administrator allowlists is readable in bulk**, up to the row cap, in any shape the
+  guard accepts. Allowlist `sales_order` and the token holder can read every customer name, e-mail
+  and telephone number in the store.
+- Credentials, sessions and config secrets are permanently out of reach (see
+  [Protected set](#1-protected-set--vetoes-everything)). **Customer personal data is not** — it lives
+  in ordinary columns on the tables people most want to query. Under GDPR-style regimes, allowlisting
+  those tables is a **processing decision**, not a convenience one.
+- Every query this tool runs is recorded in `magebit_mcp_audit_log`, so whoever can read that table
+  can see what was asked of the database. See [Audit trail](#audit-trail).
+- The guard is a hand-written SQL parser. It is heavily tested, but it is not the database's own
+  parser. Treat `db.query` as a privileged capability, not a safe default.
+
+**Grant `Magebit_McpDbTools::tool_db_query` only to roles you would trust with direct database read
+access**, and grant `Magebit_McpDbTools::config` — which is what lets someone turn this on and
+choose the tables — with the same care.
+
+If you do not want raw SQL exposed over MCP, **do not install this module**. Prefer the domain tools
+(`Magebit_McpOrderTools`, `Magebit_McpCatalogTools`, `Magebit_McpCustomerTools`, …): same data,
+narrow ACL per tool, fixed response fields, and named arguments instead of an opaque SQL string.
+Reach for `db.query` only when a question cannot be answered any other way.
+
+This tool is **not a way around them**. It requires the same admin resources the domain tools
+require: every table a statement names must be mapped to the admin ACL resource that reads it (see
+[The gates](#the-gates)), and the caller's role must hold all of them. Raw SQL therefore reads
+exactly what its holder could already reach in the admin UI — no more — and an unmapped table is
+refused rather than waved through.
 
 ---
 
@@ -25,32 +53,28 @@ the data behind those tables less sensitive.
 - [What the guard refuses](#what-the-guard-refuses)
 - [Caps and bounds](#caps-and-bounds)
 - [Deployment caveats](#deployment-caveats)
-- [The audit trail](#the-audit-trail)
-- [Left readable on purpose](#left-readable-on-purpose)
-- [What this tool is not](#what-this-tool-is-not)
+- [Audit trail](#audit-trail)
 - [Tool reference](#tool-reference)
 - [Configuration reference](#configuration-reference)
 - [Troubleshooting](#troubleshooting)
-
----
 
 ## What ships, and what is off
 
 | | |
 |---|---|
 | Tool | `db.query` — "Run Read-Only SQL Query" |
-| ACL resource | `Magebit_McpDbTools::tool_db_query` |
-| Config group | `magebit_mcp/db_tools/*` (Stores → Configuration → Magebit → MCP Server → **MCP Database Reader**) |
+| ACL resource | `Magebit_McpDbTools::tool_db_query` (its own, separate from every other MCP tool) |
+| Config group | `magebit_mcp_db_tools/general/*` (Stores → Configuration → Magebit → **MCP Server - Database Reader**) |
 | Write mode | read — so the MCP **Allow Write Tools** switch and a token's `allow_writes` flag do **not** gate it |
-| Shipped state | **disabled**, with an **empty** table allowlist |
+| Shipped state | **disabled**, with an **empty** table allowlist and an **empty** permission map |
 
-Installing and enabling the module changes nothing on its own. `magebit_mcp/db_tools/enabled`
-defaults to `0`, and even after it is switched on the tool refuses every query — including
-`SELECT 1` — until an administrator lists the tables it may read. Enabling the tool and deciding
-what it may see are two separate, deliberate acts.
+Installing the module changes nothing on its own. `enabled` defaults to `0`, and even once switched
+on the tool refuses every query — `SELECT 1` included — until an administrator lists the tables it
+may read. Enabling the tool and deciding what it may see are two separate, deliberate acts.
 
-Because the tool is a *read* tool, the two write gates that protect the rest of the MCP surface do
-not apply to it. Its own `enabled` flag and its own ACL resource are the whole gate.
+Because this is a *read* tool, the two write gates that protect the rest of the MCP surface do not
+apply. Its own `enabled` flag, its own ACL resource, and the admin resource each named table maps to
+are the whole gate.
 
 ## Install
 
@@ -62,10 +86,7 @@ bin/magento setup:di:compile
 bin/magento cache:flush
 ```
 
-`Magebit_Mcp` is the only Magebit dependency. If you do not want raw SQL exposed over MCP at all,
-do not install this module — there is nothing to configure away.
-
-After installing, confirm the tool is registered and its ACL resolves:
+`Magebit_Mcp` is the only Magebit dependency. Then confirm the tool registered and its ACL resolves:
 
 ```bash
 bin/magento magebit:mcp:tools:list
@@ -74,170 +95,137 @@ bin/magento magebit:mcp:tools:validate-acl
 
 ## The gates
 
-Three things must line up before a query runs. All three are separate on purpose.
+Four things must line up before a query runs.
 
-**1. `magebit_mcp/db_tools/enabled` = 1.** Stores → Configuration → Magebit → MCP Server → MCP
-Database Reader → **Enable Read-Only SQL Tool**. While this is off the tool refuses every call with
-a message naming the config path, and no database connection is opened.
-
-**2. The `Magebit_McpDbTools::tool_db_query` ACL resource**, held by the admin role behind the
-calling token. It sits under System → **MCP Database Reader** in the role-resource tree, separate
-from every other MCP tool ACL, so a role can hold the rest of the MCP surface without holding raw
-SQL. A token whose role lacks it gets `-32004 FORBIDDEN`.
-
-**3. Optionally, per-token tool scoping.** A token can be restricted to a named set of tools:
+1. **`magebit_mcp_db_tools/general/enabled` = 1.** While off, every call is refused with a message
+   naming the config path and no database connection is opened.
+2. **The `Magebit_McpDbTools::tool_db_query` ACL resource**, held by the admin role behind the
+   calling token. Without it: `-32004 FORBIDDEN`. This resource appears in System → Permissions →
+   User Roles under **MCP → MCP Tools**, where it can be granted to specific admin roles and scoped
+   bearer tokens. It is its own separate resource, distinct from every other MCP tool.
+3. **The admin ACL resource each named table takes to read**, from the **Table Permission Map**
+   (`table_acl_map`). The tool reads the tables out of the statement and demands every resource they
+   map to, so a role that may not open orders in the admin cannot read `sales_order` over SQL
+   either — the MCP surface stays inside what the admin UI would allow. A table with **no** line in
+   the map is refused outright, naming the table and the setting: the tool will not run a read it
+   cannot attach a permission to, so a missing line fails closed rather than skipping the check.
+   The map ships empty, which means an allowlisted table is not readable until it is mapped too.
+4. **Optionally, per-token tool scoping** — the cheapest way to keep SQL access on a dedicated token
+   rather than on the one an agent uses for everything else:
 
 ```bash
 bin/magento magebit:mcp:token:create --admin-user=<user> --name='<label>' --scope=db.query
 ```
 
-A token created with `--scope` may call only the tools it names; a token created without one may
-call anything its admin role allows. This is the cheapest way to keep SQL access on a dedicated
-token instead of on the token an agent uses for everything else.
+A token created with `--scope` may call only the tools it names; one created without may call
+anything its admin role allows.
 
-### Who may *enable* it
+**Who may enable it.** The config lives in its own section, gated by its own ACL resource,
+`Magebit_McpDbTools::config` — separate from `Magebit_Mcp::config`, which covers the rest of the
+MCP server. Reaching general MCP configuration does **not** let someone switch raw SQL on or edit
+the allowlist; that requires `Magebit_McpDbTools::config` specifically, grantable to a different,
+and usually narrower, set of roles than those who may *use* the tool.
 
-The **MCP Database Reader** configuration group lives in the `magebit_mcp` section, which is gated
-by the `Magebit_Mcp::config` ACL resource. Anyone who can reach MCP configuration can therefore
-switch raw SQL on and edit the table allowlist. Treat `Magebit_Mcp::config` as the "may enable raw
-database reads" permission and grant it accordingly — it is a different, and generally narrower,
-set of people than those who may *use* the tool.
-
-The protected set described below is the one part of the model that admin access cannot weaken.
+The protected set below is the one part of the model that admin access cannot weaken.
 
 ## The access model
 
-Three layers, evaluated in this order. Every layer runs on every query; none of them can
-short-circuit an earlier one.
+Three layers, every one run on every query. None can short-circuit another.
 
 ### 1. Protected set — vetoes everything
 
-Declared in this module's `etc/di.xml` as constructor arrays on
-`Magebit\McpDbTools\Model\TableAccessPolicy`. These names are refused wherever they appear in a
-statement, **including when an administrator lists them as allowed** — listing one is itself a
-configuration error the tool reports rather than silently ignores.
+Class constants on `Magebit\McpDbTools\Model\TableAccessPolicy`. These names are refused wherever
+they appear, **including when an administrator lists them as allowed** — listing one is a
+configuration error the tool reports rather than ignores.
 
-Why `di.xml` and not a config field or a class constant:
+The shipped set is a floor, not a default. It is in code rather than admin config (which the actor
+it defends against could edit) and rather than a `di.xml` argument (which Magento merges *by item
+name*, so a module re-declaring `core_config_data` would replace that entry and quietly drop it).
+The same three `di.xml` arguments still exist and are unioned on top, so a module can add its own
+credential tables but can never remove one of these. See [`docs/EXTENDING.md`](docs/EXTENDING.md).
 
-- **Not admin config.** A protected set that the admin panel can edit is weakenable by exactly the
-  actor it defends against — an admin-panel user, or anyone holding a stolen admin session. Nothing
-  reachable over MCP or through the admin UI can touch this list.
-- **Not a class constant.** Weakening the set requires filesystem write access *plus* a
-  `setup:di:compile` run, which puts it out of reach of both of the above; but a constant would also
-  block the legitimate case — a project or satellite module adding *its own* credential tables
-  through a `di.xml` merge, with no patch to this module. See `docs/EXTENDING.md`.
-
-Matched **widely** — exactly, behind this install's table prefix (`m2_admin_user`), and as a
-contiguous run of underscore-delimited words inside a longer identifier, so wrapper tables such as
-`custom_admin_user_map` are caught too:
+Matched **widely** — exactly, behind this install's table prefix, and as a run of underscore-
+delimited words inside a longer identifier, so wrappers like `custom_admin_user_map` are caught:
 
 | Name | Holds |
 |---|---|
-| `admin_user` | Admin accounts and password hashes |
-| `admin_passwords` | Admin password history |
-| `admin_user_session` | Live admin sessions |
-| `admin_user_expiration` | Admin account expiry |
+| `admin_user`, `admin_passwords` | Admin accounts and password hashes, password history |
+| `admin_user_session`, `admin_user_expiration` | Live admin sessions, account expiry |
 | `oauth_token`, `oauth_consumer`, `oauth_token_request_log` | Magento web-API OAuth credentials |
 | `magebit_mcp_token` | MCP bearer-token hashes |
 | `magebit_mcp_oauth_client`, `magebit_mcp_oauth_auth_code`, `magebit_mcp_oauth_refresh_token` | MCP OAuth credentials |
-| `magebit_mcp_oauth_authorize_handoff` | In-flight authorizations (client id, redirect URI, state, PKCE challenge) |
-| `magebit_mcp_audit_log` | This tool's own trail — see [The audit trail](#the-audit-trail) |
+| `magebit_mcp_oauth_authorize_handoff` | In-flight authorizations (redirect URI, state, PKCE challenge) |
+| `magebit_mcp_audit_log` | This tool's own trail |
 | `persistent_session` | "Remember me" session keys |
 | `admin_adobe_ims_webapi` | Adobe IMS API credentials |
 | `password_reset_request_event` | Password-reset throttling records |
-| `tfa_user_config` | Admin two-factor secrets — `encoded_config` holds the TOTP shared secret |
+| `tfa_user_config` | Admin two-factor secrets (TOTP shared secret) |
 | `core_config_data` | Encrypted payment-gateway credentials and API keys |
 
-Matched **exactly, or behind the table prefix** (`session`, `m2_session`) and nothing wider,
-because word-run matching on single common words would refuse ordinary columns such as
-`customer_entity.session_cutoff`:
+Matched **exactly, or behind the table prefix**, and nothing wider — word-run matching on single
+common words would refuse ordinary columns such as `customer_entity.session_cutoff`:
 
 | Name | Holds |
 |---|---|
-| `session` | Database-backed sessions (`session/save = db`) — everything needed to hijack one |
-| `cache` | Database cache backend — the config cache (decrypted values included) and rendered HTML |
-| `cache_tag` | Cache tag index |
+| `session` | Database-backed sessions — everything needed to hijack one |
+| `cache`, `cache_tag` | Database cache backend (config cache with decrypted values, rendered HTML) |
 
 Matched by **strict equality only** — server-owned names that wider matching would over-deny:
+`mysql` (server password hashes), `information_schema`, `performance_schema`, `sys`, `processlist`
+and `innodb_trx` (other sessions' SQL text), `user_privileges`.
 
-| Name | Why |
-|---|---|
-| `mysql` | `mysql.user` holds server password hashes |
-| `information_schema` | Schema-wide introspection, and the views below |
-| `performance_schema`, `sys` | Server internals |
-| `processlist`, `innodb_trx` | Other sessions' SQL text, literals included |
-| `user_privileges` | Server grant tables |
-
-An administrator can **add** to the protected set through **Additional Denied Tables**
-(`magebit_mcp/db_tools/extra_denied_tables`), which is matched widely like the first group. Entries
-there only ever remove access; they can never grant it.
+An administrator can **add** to the set via **Additional Denied Tables**, matched widely like the
+first group. Entries there only ever remove access.
 
 ### 2. Table allowlist — empty by default
 
-`magebit_mcp/db_tools/allowed_tables`. One bare table name per line; blank lines and `#` lines are
-ignored. If your install uses a table prefix, list names **without** it.
+`magebit_mcp_db_tools/general/allowed_tables`. One bare table name per line; blank and `#` lines ignored.
+With a table prefix, list names **without** it.
 
-- **Empty means every query is refused**, `SELECT 1` included. That is the shipped default.
+- **Empty refuses every query**, `SELECT 1` included. That is the shipped default.
 - Only identifiers in **table positions** need an entry — after `FROM`, after any `JOIN`, after a
-  comma continuing a table list, as a `DESCRIBE`/`EXPLAIN` target, or after `IN` in a `SHOW`
-  statement. Table aliases, derived-table aliases, column aliases and CTE names need no entry.
-- Matching is **exact, or exact behind this install's table prefix** — never the wide word-run
-  match. An allowed `customer_entity` does not admit `customer_entity_backup`; an allowed `user`
-  does not admit `admin_user`.
-- Schema-qualified references (`mydb.cms_page`) are accepted only when the qualifier is this
-  store's own database name from `env.php`. If that name cannot be read, every qualified reference
-  is refused.
-- A malformed entry — dotted, quoted, spaced, wildcarded, non-ASCII — refuses **every** query with
-  a message naming the offending line, rather than being silently dropped. A typo therefore reads as
-  "fix line X", not as "the tool is broken".
+  comma continuing a table list, as a `DESCRIBE`/`EXPLAIN` target, or after `IN` in a `SHOW`. Alias,
+  derived-table, column and CTE names need none.
+- Matching is **exact, or exact behind the table prefix** — never the wide word-run match. An
+  allowed `customer_entity` does not admit `customer_entity_backup`; an allowed `user` does not
+  admit `admin_user`.
+- Schema-qualified references (`mydb.cms_page`) are accepted only when the qualifier is this store's
+  own database name from `env.php`. If that cannot be read, every qualified reference is refused.
+- A malformed entry — dotted, quoted, spaced, wildcarded, non-ASCII — refuses **every** query with a
+  message naming the offending line, so a typo reads as "fix line X", not "the tool is broken".
 
-An allowlist is used rather than a denylist because a denylist defaults to *readable* for every
-table a future module adds, and rots as upstream renames things.
+An allowlist rather than a denylist, because a denylist defaults to *readable* for every table a
+future module adds.
 
 ### 3. Column deny-list — runs on every statement
 
-Independent of table resolution, because no table allowlist can protect
-`customer_entity.password_hash` or `sales_order_payment.cc_*` — those sit on tables a useful
-allowlist contains. A query naming any of these anywhere (select list, `WHERE`, `JOIN`, alias) is
-refused:
+Independent of table resolution: no table allowlist can protect `customer_entity.password_hash` or
+`sales_order_payment.cc_*`, which sit on tables a useful allowlist contains. A query naming any of
+these anywhere — select list, `WHERE`, `JOIN`, alias — is refused:
 
 | Term | Catches |
 |---|---|
 | `password_hash`, `password` | Customer and admin password material |
 | `rp_token`, `rp_token_created_at` | Password-reset tokens |
-| `token`, `secret`, `api_key`, `authentication_string` | Credential columns generally, including third-party ones |
-| `session_id`, `session_data` | Session hijacking material on any table, `customer_visitor.session_id` included |
-| `cc` | **Every `cc_*` column** on `sales_order_payment` and `quote_payment` — 30 of them, not just the encrypted ones. Last four plus brand plus expiry, joined to a cardholder name from `sales_order`, is PCI cardholder data even though no single column reads like a secret. |
-| `cc_number_enc`, `cc_cid_enc`, `cc_owner` | Subsets of the rule above, kept so the rejection message names the most sensitive columns precisely |
-| `confirmation`, `subscriber_confirm_code` | Account-activation keys. `customer_entity.confirmation` is the value `/customer/account/confirm` accepts before logging the customer in — possession of it *is* a login, not a status flag. |
-| `link_hash` | `downloadable_link_purchased_item` — the capability token in a shareable download URL |
-| `additional_information` | Serialized gateway payloads on `sales_order_payment`, `quote_payment`, `sales_payment_transaction` and `paypal_payment_transaction`. Their keys are string content no identifier scan can see; `raw_details_info` alone can carry a masked PAN, expiry, BIN and AVS/CVV results. |
+| `token`, `secret`, `api_key`, `authentication_string` | Credential columns generally, third-party ones included |
+| `session_id`, `session_data` | Session hijacking material on any table |
+| `cc` | **Every `cc_*` column** on `sales_order_payment` / `quote_payment` — ~30, not just the encrypted ones. Last four + brand + expiry joined to a name from `sales_order` is PCI cardholder data. |
+| `cc_number_enc`, `cc_cid_enc`, `cc_owner` | Subsets of the above, kept so the refusal names the most sensitive columns precisely |
+| `confirmation`, `subscriber_confirm_code` | Account-activation keys. `customer_entity.confirmation` is what `/customer/account/confirm` accepts — possession of it *is* a login. |
+| `link_hash` | The capability token in a shareable download URL |
+| `additional_information` | Serialized gateway payloads; `raw_details_info` alone can carry a masked PAN, expiry, BIN and AVS/CVV results |
 | `x_forwarded_for` | Customer IP addresses on `sales_order` |
 
-Matching is wide and deliberately so: `token` also refuses `access_token`, `token_hash` and
-`customer_api_key`, and the bare `cc` term expands to every `cc_*` column. Known collateral damage,
-all fail-closed:
-
-- Any column carrying a protected table's word run — `admin_user_id`, so you cannot join on the
-  audit log's FK column.
-- Any *table* whose name contains a denied column word — a project table called `token_registry`,
-  `secret_ledger` or (with the `cc` family rule) one whose name has `cc` as a word is unreachable.
-  There is no such table in Magento core.
-- `session_id` / `session_data` on any table, so `customer_visitor.session_id` cannot be read.
-- `confirmation` on any table, so "how many customers have not confirmed their address yet?" cannot
-  be answered through this tool. A bearer credential is worth more than that query.
-- `additional_information` everywhere, including the non-payment uses a third-party module may have
-  for the same column name.
-
-Every term is pinned by a test that executes the matcher against the **real column spelling** it
-exists to catch, and a term with no such spelling fails the suite — a term that matches nothing
-reads as protection while protecting nothing, which is a bug this list has had before.
+Matching is wide on purpose, so there is known fail-closed collateral damage: `admin_user_id` (you
+cannot join on the audit log's FK), a project *table* whose name contains a denied word run
+(`token_registry`, `secret_ledger`), `session_id` on any table, and `confirmation` — so "how many
+customers have not confirmed yet?" is unanswerable here. A bearer credential is worth more than that
+query.
 
 ## Choosing an allowlist
 
-A starting point to paste and trim. It is **not** a recommendation that exposing these tables is
-safe — review every line against your own data-protection obligations and delete anything you do
-not actively need:
+A starting point to paste and **trim**. It is not a claim that exposing these is safe — review every
+line against your own data-protection obligations and delete what you do not actively need:
 
 ```
 catalog_product_entity
@@ -259,8 +247,8 @@ sales_order_item
 sales_order_status_history
 ```
 
-**Be clear-eyed about what the useful tables contain.** The last three lines above, and the tables
-operators most often want to add next, are personal data:
+**Be clear-eyed about what the useful tables contain.** The last three lines, and the tables
+operators most often add next, are personal data:
 
 | Table | Personal data it carries |
 |---|---|
@@ -269,261 +257,172 @@ operators most often want to add next, are personal data:
 | `sales_order_item`, `sales_order_status_history` | Purchase history, operator comments |
 | `customer_entity` | E-mail, name, date of birth, tax/VAT number |
 | `customer_address_entity` | Home addresses and telephone numbers |
-| `quote`, `quote_address`, `quote_item` | The same, for abandoned carts — often for people who never completed an order |
+| `quote`, `quote_address`, `quote_item` | The same for abandoned carts — often people who never ordered |
 | `newsletter_subscriber` | E-mail addresses and consent state |
 
-`sales_order_payment` and `quote_payment` are a special case: you can list them, and `method`,
-`amount_*` and the FK columns come back, but every `cc_*` column and `additional_information` are
-refused, so the payment-analytics questions people usually want them for are mostly unanswerable.
-That is deliberate.
-
-Listing any of them means the token holder can read that data, in bulk, up to the row cap, on any
-query shape the guard accepts. Column names carrying secrets are still refused, but a customer's
-name, e-mail and address are ordinary columns and will come back. Under GDPR-style regimes this is
-a processing decision, not a convenience one.
+`sales_order_payment` / `quote_payment` are a special case: you can list them and get `method`,
+`amount_*` and FK columns, but every `cc_*` column and `additional_information` are refused, so most
+payment-analytics questions stay unanswerable. That is deliberate.
 
 Start with the narrowest list that answers the questions you actually have, and add to it when a
 refusal proves you need more.
 
 ## What the guard refuses
 
-Refusals arrive as JSON-RPC `-32011 TOOL_EXECUTION_FAILED` with an operator-facing message naming
-what was refused and, for configuration problems, the setting to change. The messages are the
-tool's usability surface — an MCP client normally self-corrects from them in one retry.
+Refusals arrive as `-32011 TOOL_EXECUTION_FAILED` with a message naming what was refused and, for
+configuration problems, the setting to change. An MCP client normally self-corrects in one retry.
 
 **Statement shape**
 
-- **One statement only.** A `;` anywhere but at the very end is refused; a trailing one is
-  accepted. `SELECT 1; DROP TABLE x` never reaches the database.
-- **Leading keyword allowlist:** `SELECT`, `WITH`, `SHOW`, `DESCRIBE`, `DESC`, `EXPLAIN`. Checked
-  as a whole token, so a keyword split by a comment (`SEL/**/ECT`) is refused rather than
-  reassembled. A statement beginning with `(` is refused too.
-- **Mutating and side-effecting keywords** are refused anywhere in the statement: the DML/DDL set,
-  `SET`, `LOCK`, `CALL`, `LOAD`, `PREPARE`, `FLUSH`, `KILL`, `INTO`/`OUTFILE`/`DUMPFILE`,
-  `LOAD_FILE`, `SLEEP`, `BENCHMARK`, the `*_LOCK` family, the replication-wait family, and
-  `SYS_EXEC`/`SYS_EVAL`.
-- **Table-value constructors** — `TABLE t` (MySQL 8.0.19+) and `VALUES ROW(…)` — are refused
-  anywhere, including as a `UNION` branch. `TABLE t` is `SELECT * FROM t` written with no `*` and
-  no column names, so it would otherwise return every column of a table while giving the wildcard
-  rule and the column deny-list nothing to reject. Cost: a backtick-quoted identifier literally
-  named `` `table` `` or `` `values` `` is refused too; neither exists in Magento.
-- **Sequence forms** — `NEXT VALUE FOR s` advances a sequence, which is a write, and
-  `PREVIOUS VALUE FOR s` reads one that was never allowlist-checked. Both phrases are refused. The
-  bare word `value` is *not* denied — it names a column on every EAV value table — so only the
-  three-word phrase is matched.
-- **Session and system variables** (`@name`, `@@name`, `@x := …`) are refused — a classic
-  filter-evasion and state-mutation primitive. `@` inside a string literal is unaffected, so
-  `email LIKE '%@example.com'` still works.
-- **MySQL executable comments** (`/*! … */`, `/*+ … */`) are refused outright: the server executes
+- **One statement only.** A `;` anywhere but the very end is refused. `SELECT 1; DROP TABLE x` never
+  reaches the database.
+- **Leading keyword allowlist:** `SELECT`, `WITH`, `SHOW`, `DESCRIBE`, `DESC`, `EXPLAIN`. Checked as
+  a whole token, so `SEL/**/ECT` is refused rather than reassembled. A leading `(` is refused.
+- **Mutating and side-effecting keywords** anywhere: the DML/DDL set, `SET`, `LOCK`, `CALL`, `LOAD`,
+  `PREPARE`, `FLUSH`, `KILL`, `INTO`/`OUTFILE`/`DUMPFILE`, `LOAD_FILE`, `SLEEP`, `BENCHMARK`, the
+  `*_LOCK` and replication-wait families, `SYS_EXEC`/`SYS_EVAL`.
+- **Table-value constructors** — `TABLE t` and `VALUES ROW(…)` — anywhere, including as a `UNION`
+  branch. `TABLE t` is `SELECT * FROM t` with no `*` and no column names, so it would return every
+  column while giving the wildcard rule and column deny-list nothing to reject.
+- **Sequence forms** — `NEXT VALUE FOR s` (a write) and `PREVIOUS VALUE FOR s`. Only the three-word
+  phrase is matched; the bare `value` is a column on every EAV value table.
+- **Session and system variables** (`@name`, `@@name`, `@x := …`) — a filter-evasion and
+  state-mutation primitive. `@` inside a literal is fine, so `email LIKE '%@example.com'` works.
+- **Parenless server-info keywords** — `CURRENT_USER`, `CURRENT_ROLE`, `SESSION_USER`,
+  `SYSTEM_USER` — refused with or without a following `(`, since they report the database account
+  the connection runs as.
+- **Executable comments** (`/*! … */`, `/*+ … */`, and MariaDB's `/*M! … */`): the server executes
   them while a naive scanner reads them as comments.
-- **Control characters** anywhere in the input are refused, as are unterminated comments, string
-  literals and quoted identifiers.
+- **Control characters**, unterminated comments, string literals and quoted identifiers.
 
-**Columns and wildcards**
+**Columns, literals, functions**
 
-- **No `*`, anywhere, except `COUNT(*)`.** `SELECT *` and `t.*` are refused so protected columns
-  cannot come back by accident. This is a single, auditable rule rather than a grammar, and it has
-  a real cost: it also refuses **arithmetic multiplication**. `SUM(qty * price)` will not run, and
-  SQL has no other multiplication operator, so compute products from the returned columns on your
-  side. (`*` is not checked inside `SHOW`/`DESCRIBE`/`EXPLAIN`, which return no table rows.)
-- **Duplicate column names collapse** in the response, so `SELECT a.entity_id, b.entity_id` silently
-  returns one key. Alias them.
-
-**String literals**
-
-- **Single quotes only.** `"…"` is refused: its meaning depends on `sql_mode` (a string normally, an
-  *identifier* under `ANSI_QUOTES`), and treating it as either would be wrong on some installs.
-- **No backslashes inside a literal, at all.** Whether `\` escapes the next byte depends on the
-  server's `NO_BACKSLASH_ESCAPES` mode and on the connection charset, and the tool hands the
-  validated string back for verbatim execution — so its literal boundaries must match the server's
-  under *every* configuration, not just the sampled one. Practical consequences:
-  - embed a quote by doubling it: `'O''Brien'`;
-  - match a literal `_` or `%` with the `ESCAPE` clause: `LIKE 'a!_b' ESCAPE '!'`.
-
-**Functions**
-
-- **A schema-qualified call is always refused.** `magento.count(1)` looks allowlisted if you only
-  read the word touching the `(`, but a built-in can never be schema-qualified, so a qualified name
-  always resolves to a stored function.
-- **Built-in read-only functions only** — roughly 200 of them: aggregates and window functions,
-  string/hash, numeric, date-time, cast and control-flow, JSON accessors and constructors. Anything
-  not on the list is refused, which is the only rule that can stop a **stored function or UDF**,
-  since the operator picks its name and a name-based denylist can be renamed around. The keyword
-  argument forms do work: `EXTRACT(YEAR FROM col)`, `TRIM(LEADING '0' FROM col)`,
-  `SUBSTRING(col FROM 2 FOR 3)`, `POSITION('x' IN col)`.
-- **`GROUP_CONCAT`, `JSON_ARRAYAGG` and `JSON_OBJECTAGG` are refused** even though they are
-  read-only: they collapse a whole column into one value, bounded only by `max_allowed_packet`,
-  which defeats the row cap. Use `COUNT`/`SUM`, or return rows.
-- The allowlist is **deliberately conservative**, so a legitimate built-in will occasionally be
-  missing. Extend `ALLOWED_FUNCTIONS` in `Model/QueryGuard.php` — and **never**
-  `STRUCTURAL_KEYWORDS`. That second set's safety rests on every entry being *reserved in every
-  supported server, MariaDB included*, so that it can never be the unquoted name of a stored
-  function. "Reserved in MySQL 8" is the wrong test, and is how `ANY`, `AGAINST` and `LATERAL` got
-  in and had to come out. Cost of their removal: fulltext `MATCH … AGAINST (…)` and
-  `= ANY (subquery)` are unsupported; `IN (subquery)` covers the realistic case.
-- Also refused as a side effect: `WITH cte (a, b) AS (…)` — the column-list form reads as a
-  function call. Use `WITH cte AS (SELECT … AS a, … AS b)`.
+- **No `*` anywhere except `COUNT(*)`.** A single auditable rule instead of a grammar, with a real
+  cost: it also refuses **arithmetic multiplication**, so `SUM(qty * price)` will not run — return
+  the columns and multiply client-side.
+- **Duplicate column names collapse** in the response; alias them.
+- **Single quotes only.** `"…"` is refused because its meaning depends on `sql_mode`.
+- **No backslashes inside a literal.** The validated string is executed verbatim, so its literal
+  boundaries must match the server's under *every* configuration. Double a quote (`'O''Brien'`) and
+  use `ESCAPE` for a literal `_`/`%` (`LIKE 'a!_b' ESCAPE '!'`).
+- **Quoting is reproduced byte-for-byte.** A doubled `` ` `` inside a backtick-quoted identifier
+  (`` `we``ird` ``) and a doubled `'` inside a literal stay doubled in the executed statement, so a
+  quoted name always runs as the single identifier it was validated as.
+- **A schema-qualified call is always refused.** `magento.count(1)` looks allowlisted if you read
+  only the word touching the `(`, but a built-in is never schema-qualified.
+- **Built-in read-only functions only** — roughly 200: aggregates and window, string/hash, numeric,
+  date-time, cast, control-flow, JSON. This is the only rule that can stop a **stored function or
+  UDF**, whose name the operator picks. Keyword argument forms work: `EXTRACT(YEAR FROM col)`,
+  `TRIM(LEADING '0' FROM col)`, `SUBSTRING(col FROM 2 FOR 3)`, `POSITION('x' IN col)`.
+- **`GROUP_CONCAT`, `JSON_ARRAYAGG`, `JSON_OBJECTAGG` are refused** though read-only: they collapse
+  a column into one value bounded only by `max_allowed_packet`, defeating the row cap.
+- The allowlist is deliberately conservative, so a legitimate built-in is occasionally missing.
+  Extend `ALLOWED_FUNCTIONS` in `Model/QueryGuard.php` — and **never** `STRUCTURAL_KEYWORDS`
+  (`Model/Sql/TableReferenceScanner.php`, read by this layer and the table scan alike), whose
+  safety rests on every entry being reserved in *every* supported server, MariaDB included. Cost of
+  that rule: fulltext `MATCH … AGAINST (…)` and `= ANY (subquery)` are unsupported; `IN (subquery)`
+  covers the realistic case.
+- Side effect: `WITH cte (a, b) AS (…)` reads as a function call. Use `WITH cte AS (SELECT … AS a)`.
 
 **`SHOW` forms**
 
 Accepted: `TABLES`, `COLUMNS`, `FIELDS`, `INDEX`, `INDEXES`, `KEYS`, `DATABASES`, `SCHEMAS`,
-`ENGINES`, `CHARACTER`, `CHARSET`, `COLLATION`, `VARIABLES`, `STATUS`, `WARNINGS`, `ERRORS`.
-The forms that take a table target go through the allowlist like any other table position.
-Everything else is refused, including `TRIGGERS` and `EVENTS` (they embed statement bodies),
-`TABLE STATUS` and `OPEN TABLES` (per-table row counts and names), `FUNCTION`/`PROCEDURE STATUS`,
+`ENGINES`, `CHARACTER`, `CHARSET`, `COLLATION`, `VARIABLES`, `STATUS`, `WARNINGS`, `ERRORS`. Forms
+taking a table target go through the allowlist. Everything else is refused, including `TRIGGERS` and
+`EVENTS` (they embed statement bodies), `TABLE STATUS`, `OPEN TABLES`, `FUNCTION`/`PROCEDURE STATUS`,
 `ENGINE INNODB STATUS`, `PLUGINS`, `PRIVILEGES`, `PROFILES` and the replication-status forms.
 
-Two honest caveats: `SHOW TABLES` and `SHOW DATABASES` still **enumerate names** outside the
-allowlist (judged metadata — a Magento schema is public knowledge — but it is the one place the
-allowlist is not the whole story), and `SHOW VARIABLES` / `SHOW STATUS` expose server paths and
-tuning. If either matters in your threat model, note that neither returns table data.
+Two honest caveats: `SHOW TABLES` / `SHOW DATABASES` still **enumerate names outside the allowlist**
+— the one place the allowlist is not the whole story — and `SHOW VARIABLES` / `SHOW STATUS` expose
+server paths and tuning. Neither returns table data.
 
 **`{{table_name}}` placeholders**
 
-Write `{{sales_order}}` and the real, prefixed table name is substituted before validation, so a
-client never has to guess the table prefix. Two things to know:
-
-- The substitution is **textual and unconditional** — it rewrites `{{…}}` **inside string literals
-  too**, so do not write a placeholder-shaped literal you want left alone.
-- Any brace that is not part of a resolved `{{name}}` placeholder is a hard refusal, so a wiring
-  mistake surfaces as a message rather than a confusing SQL error.
+Write `{{sales_order}}` and the real prefixed name is substituted before validation, so a client
+never guesses the prefix. The substitution is **textual and unconditional** — it rewrites `{{…}}`
+inside string literals too. Any brace that is not part of a resolved placeholder is a hard refusal.
 
 **Row limit**
 
-- A `SELECT`/`WITH` with no `LIMIT` gets one appended: the call's `limit` argument if given,
-  otherwise **Default Row Limit**, clamped to **Maximum Row Limit**.
-- A `LIMIT` above the ceiling is **refused with the ceiling in the message, never silently
-  clamped** — clamping would let a client believe it had seen every matching row.
+- A `SELECT`/`WITH` with no `LIMIT` gets one appended: the call's `limit` argument, else **Default
+  Row Limit**, clamped to **Maximum Row Limit**.
+- A `LIMIT` above the ceiling is **refused with the ceiling in the message, never silently clamped**
+  — clamping would let a client believe it had seen every matching row.
 - `LIMIT` may appear **once**, as the final clause. `LIMIT n`, `LIMIT offset, n` and
-  `LIMIT n OFFSET offset` are accepted; a `LIMIT` only inside a subquery, or a non-literal one
-  (`LIMIT 1+1`), is refused with an instruction to put it at the end.
-- `SHOW`/`DESCRIBE`/`EXPLAIN` get no `LIMIT` appended — the byte cap below is their only bound.
+  `LIMIT n OFFSET offset` are accepted; one only inside a subquery, or non-literal (`LIMIT 1+1`), is
+  refused.
+- `SHOW`/`DESCRIBE`/`EXPLAIN` get no `LIMIT` — the byte cap is their only bound.
 
 ## Caps and bounds
 
 | Bound | Value | What it bounds |
 |---|---|---|
-| Query length | 6 – 8000 characters | The work the validator itself can be made to do |
+| Query length | max 8000 characters (a 6-character minimum is advertised in the input schema) | The work the validator can be made to do |
 | Row cap | **Default Row Limit**, ceiling **Maximum Row Limit** | Rows returned |
-| Response payload | ~1 MiB (1 048 576 bytes) of serialised JSON | Bytes returned, and PHP memory during the read |
+| Response payload | ~1 MiB of serialised JSON | Bytes returned, and PHP memory during the read |
 | Statement timeout | **Statement Timeout (seconds)** | Server-side work per query |
 
-**The row cap does not bound bytes.** One row of concatenated `TEXT` columns can be megabytes on
-its own, which is what the payload cap is for. Rows are read one at a time with result buffering
-switched off, and the read stops the moment the budget would be exceeded, so a result set far
-larger than the cap is trimmed rather than materialised. Measured on a ~1 GB result set: no
-measurable increase in PHP peak memory. If the connection cannot be switched to unbuffered reads
-the tool still runs, but the whole result set is held in memory while it is read; that case is
-logged as a warning in `var/log/magebit_mcp.log`.
+**The row cap does not bound bytes.** One row of concatenated `TEXT` columns can be megabytes, which
+is what the payload cap is for. Rows are read one at a time with result buffering off and the read
+stops the moment the budget would be exceeded, so an oversized result set is trimmed rather than
+materialised. If the connection cannot be switched to unbuffered reads the tool still runs, but the
+whole result set is held in memory; that is logged as a warning in `var/log/magebit_mcp.log`. If the
+*first* row alone exceeds the budget the call fails explicitly rather than returning zero rows.
 
-If the *first* row alone exceeds the budget the call fails with an explanatory message rather than
-returning zero rows, which would be indistinguishable from an empty result.
+**The statement timeout is the only bound on query *work*.** The guard bounds shape and tables, not
+cost — an unindexed join or a wide hashing scan over an allowlisted table is limited by the timeout
+and nothing else. It is applied per call with `SET SESSION max_execution_time` (MySQL 5.7.8+) or
+`max_statement_time` (MariaDB 10.1+), whichever the server accepts. **If neither can be set the
+query is refused rather than run untimed**, with a `critical` log line. There is no override.
 
-**The statement timeout is the only bound on query *work*.** The guard bounds a query's shape and
-the tables it may name; it does not bound cost. An unindexed join, a cross join or a wide hashing
-scan over an allowlisted table is limited by the timeout and by nothing else. Two consequences:
-
-- The timeout is applied per call with `SET SESSION max_execution_time` (MySQL 5.7.8+) or
-  `SET SESSION max_statement_time` (MariaDB 10.1+), whichever the server accepts — chosen by
-  flavour, so a healthy install issues exactly one such statement and logs nothing.
-- **If neither can be set, the query is refused rather than run without a time limit**, with a
-  `critical` line in `var/log/magebit_mcp.log`. There is deliberately no override.
-
-`sql_mode` is also pinned per call, by *appending* `NO_BACKSLASH_ESCAPES` to the session's existing
-modes (never by assigning a mode set, which would drop `STRICT_TRANS_TABLES` and friends for the
-rest of the request on the shared connection). This is belt-and-braces behind the backslash refusal;
-if it fails, the call continues with a warning, because the guard refuses backslashes and `"`
-whatever the mode is.
+`sql_mode` is also pinned per call by *appending* `NO_BACKSLASH_ESCAPES` to the session's existing
+modes (never assigning a set, which would drop `STRICT_TRANS_TABLES` for the rest of the request).
+This is belt-and-braces behind the backslash refusal; if it fails the call continues with a warning.
 
 ## Deployment caveats
 
-All four are real and verified. Read them before enabling the tool on a shared or proxied database
-connection.
+Read these before enabling the tool on a shared or proxied database connection.
 
-**Persistent connections.** With `db/connection/default/persistent` set in `env.php`, the
-connection outlives the request — so the session statement timeout and the appended `sql_mode` are
-inherited by whatever reuses that connection next. `max_execution_time` applies only to read-only
-`SELECT`s and the `sql_mode` change is additive, so this is not expected to break writes, but it is
-a side effect on state you did not ask to change. If that is unacceptable, do not run this tool on
-a persistent connection.
+- **Persistent connections.** The session timeout and the appended `sql_mode` are read back before
+  they are applied and written back on every exit path, the failure paths included, so a connection
+  that outlives the request (`db/connection/default/persistent` in `env.php`) is handed on with the
+  values it arrived with. Two windows remain: anything else running on the same connection *during*
+  the call sees the tool's timeout and `sql_mode`, and the reconnect-retry below restores nothing
+  because it bypasses both guards to begin with. If the server will not report its own session state
+  the tool leaves the guards in place and logs a warning rather than guessing a value to write back.
+- **Magento's reconnect-retry bypasses both session guards.** On MySQL errors 2006/2013 Magento
+  re-runs the statement on a fresh connection carrying neither the timeout nor the `sql_mode` pin,
+  and that attempt runs **buffered**, so the memory bound is lost for it. The shared connection is
+  never left unbuffered.
+- **A connection proxy that swallows `SET SESSION` breaks the tool, by design.** ProxySQL,
+  MaxScale-style multiplexers and some managed-database front ends drop session `SET` statements. If
+  every query is refused with a message about `max_execution_time` / `max_statement_time`, that is
+  why. There is no escape hatch — give the tool a connection where session variables can be set, or
+  leave it disabled.
+- **`SELECT VERSION()` runs outside the work bound.** The server-flavour probe (once per process,
+  memoised) is issued before the timeout, because the timeout's variable name depends on its answer.
+  Constant-time, no user input.
 
-**Magento's reconnect-retry bypasses both session guards.** On MySQL errors 2006 (*server has gone
-away*) and 2013 (*lost connection*), Magento reconnects and re-runs the statement on a **fresh**
-connection, which carries neither the statement timeout nor the `sql_mode` pin. That attempt also
-runs **buffered** — `closeConnection()` does not reset the adapter's connection-flags marker, so
-the reconnect skips the block that would switch buffering off — so the memory bound is lost for
-that one attempt too. The shared connection is never left unbuffered. Fixing this properly means
-hooking the reconnect rather than the tool, so it is documented rather than worked around.
+## Audit trail
 
-**A connection proxy that swallows `SET SESSION` breaks the tool, by design.** ProxySQL,
-MaxScale-style multiplexers and some managed-database front ends silently drop or reject session
-`SET` statements. If every query comes back refused with a message about `max_execution_time` /
-`max_statement_time`, and `var/log/magebit_mcp.log` carries a `critical` line about it, that is the
-cause. There is no configuration escape hatch: a query with no enforceable time limit is exactly
-the case the refusal exists for. Give the tool a connection on which session variables can be set,
-or leave it disabled.
-
-**`SELECT VERSION()` runs outside the work bound.** The server-flavour probe (once per PHP process,
-memoised) is issued before the timeout is applied, because the timeout's variable name depends on
-its answer. It is a constant-time server call with no user input, so the practical exposure is nil
-— stated here because it is genuinely the one statement in the flow with no time budget.
-
-## The audit trail
-
-Every call writes one row to `magebit_mcp_audit_log`, like every other MCP call. For this tool the
-`result_summary_json` carries the **executed SQL, verbatim**, truncated to the first 1000
-characters, plus the row count.
-
-**The SQL is not PII-redacted.** MCP's redactor works on named arguments; a SQL string is opaque to
-it. So a query such as `… WHERE email = 'someone@example.com'` leaves that e-mail address in the
-audit table, and a `WHERE` clause naming a person, an order or an address puts it there too.
-
-That is intentional — an audit trail for raw SQL access is worth very little without the statement
-— but it has two consequences an operator should plan for:
+Every call writes one row to `magebit_mcp_audit_log`. For this tool `result_summary_json` carries a
+summary of the executed SQL, truncated to 1000 characters, plus the row count. Two consequences to
+plan for:
 
 1. **The audit table inherits the sensitivity of the queries run.** Whoever holds
-   `Magebit_Mcp::mcp_audit` can read those literals. Include it in your retention policy;
-   `magebit_mcp/general/retention_days` governs the purge cron.
-2. **The tool cannot read its own trail.** `magebit_mcp_audit_log` is in the protected set, so
-   allowlisting it is a configuration error. One operator cannot use `db.query` to read another
-   operator's queries. Use the admin audit-log grid instead.
+   `Magebit_Mcp::mcp_audit` can read what was asked of the database. Include it in your retention
+   policy; `magebit_mcp/general/retention_days` governs the purge cron.
+2. **The tool cannot read its own trail.** `magebit_mcp_audit_log` is protected, so allowlisting it
+   is a configuration error. Use the admin audit-log grid.
 
-The `executed_sql` field in the response is the same normalised string that ran: comments stripped,
+`executed_sql` in the response is the same normalised string that ran — comments stripped,
 whitespace collapsed, `LIMIT` appended. What was validated is what executed.
 
-## Left readable on purpose
-
-Two tables an operator might expect to be protected are not. Both were considered and left out
-deliberately, so that the decision is yours rather than ours:
-
-- **`magebit_mcp_prompt`** — operator-authored MCP workflow text. Not credential material, and
-  reading it is a legitimate way to audit what the prompts say.
-- **`queue_message`** — a legitimate debugging target, and the reason the message-queue tables were
-  left alone. **Be careful with it.** `queue_message.body` is a serialised consumer payload, and
-  some consumers embed customer data or, in bespoke integrations, credentials. It is not blocked;
-  it is simply not recommended. If you allowlist it, look at what your consumers actually put in
-  there first, and use **Additional Denied Tables** to block it again if you would rather not
-  think about it.
-
-Nothing else outside the protected set is special: **any table you allowlist is readable**, up to
-the row cap, in any shape the guard accepts.
-
-## What this tool is not
-
-- **Not a migration or administration tool.** It cannot write, create, alter, drop, lock, or run a
-  stored procedure. There is no configuration that makes it able to.
-- **Not a general metadata browser.** `information_schema` is protected, so schema-wide
-  introspection is unavailable. What remains is `DESCRIBE` / `SHOW COLUMNS` / `SHOW INDEX` on
-  allowlisted tables (plus the bare `SHOW TABLES` / `SHOW DATABASES` name lists noted above). A
-  purpose-built redacting metadata tool would be the right answer if that becomes limiting; this
-  tool is not it.
-- **Not a substitute for the domain tools.** `Magebit_McpOrderTools`,
-  `Magebit_McpCatalogTools`, `Magebit_McpCustomerTools` and their siblings expose the same data
-  through Magento's own service contracts, with a narrow ACL per tool, a fixed set of fields per
-  response, and named arguments that MCP's audit redactor can actually see. Reach for `db.query`
-  when a question genuinely cannot be answered any other way.
-- **Not a promise about your MCP client's limits.** The ~1 MiB cap is on this tool's own payload;
-  the JSON-RPC envelope and transport escaping add to what goes over the wire.
+**Left readable on purpose.** `magebit_mcp_prompt` (operator-authored workflow text, legitimate to
+audit) and `queue_message` (a real debugging target) are *not* protected. Be careful with the
+latter: `queue_message.body` is a serialised consumer payload, and some consumers embed customer
+data or credentials. Check what your consumers put there before allowlisting it, and use
+**Additional Denied Tables** to block it again if you would rather not think about it.
 
 ## Tool reference
 
@@ -531,12 +430,12 @@ the row cap, in any shape the guard accepts.
 
 | Argument | Type | Required | Notes |
 |---|---|---|---|
-| `query` | string | yes | 6–8000 characters, one read-only statement. `{{table_name}}` is substituted with the real, prefixed name. |
-| `limit` | integer | no | 1 … **Maximum Row Limit**. Used **only** when the statement carries no `LIMIT` of its own; the statement's own `LIMIT` always wins. |
+| `query` | string | yes | Up to 8000 characters, one read-only statement. `{{table_name}}` is substituted with the real prefixed name. |
+| `limit` | integer | no | 1 … **Maximum Row Limit**. Used **only** when the statement carries no `LIMIT`; the statement's own always wins. |
 
-The `limit` argument's maximum is baked into the schema at `tools/list` time. If you lower
-**Maximum Row Limit** after a client cached the tool list, that client may offer a maximum the
-guard now refuses; the refusal names the real ceiling, so it self-corrects in one call.
+`limit`'s maximum is baked into the schema at `tools/list` time, so lowering **Maximum Row Limit**
+after a client cached the tool list may have it offer a maximum the guard now refuses. The refusal
+names the real ceiling and self-corrects in one call.
 
 **Response**
 
@@ -551,71 +450,56 @@ guard now refuses; the refusal names the real ceiling, so it self-corrects in on
 }
 ```
 
-- `columns` — keys of the first row; `[]` on an empty result set (an associative fetch cannot report
-  column names for zero rows — use `DESCRIBE` if you need them).
-- `limit_applied` — the row cap in force; `null` for `SHOW`/`DESCRIBE`/`EXPLAIN`.
-- `truncated` — the row cap was reached, or the response was trimmed to fit the byte cap. Either
-  way there are probably more rows: narrow the query rather than paging blindly.
-- `executed_sql` — the exact statement that ran.
+- `columns` — keys of the first row; `[]` on an empty result set. Use `DESCRIBE` if you need names.
+- `limit_applied` — the cap in force; `null` for `SHOW`/`DESCRIBE`/`EXPLAIN`.
+- `truncated` — the row cap was reached or the payload was trimmed. Narrow the query rather than
+  paging blindly.
 
-**Order of operations per call**
+**Order of operations per call:** `enabled` gate (no connection if off) → `{{table_name}}`
+substitution → query guard → session timeout and `sql_mode` pin → streamed execution → payload
+shaping → audit row.
 
-`enabled` gate (no connection opened if off) → `{{table_name}}` substitution → query guard →
-session statement timeout and `sql_mode` pin → streamed execution → payload shaping → audit row.
-
-Errors the database raises about the statement itself — an unknown column, a missing table, a query
-the server interrupted on the time limit — are surfaced with the driver's own message, because those
-are the ones a caller can act on. Connection-level failures are deliberately **not** echoed; their
-messages describe the server and its credentials (`Access denied for user 'magento'@'…'`), so the
-caller gets a generic message and the real one goes to `var/log/magebit_mcp.log`.
+Errors about the statement itself — unknown column, missing table, interrupted by the time limit —
+are surfaced with the driver's message, since those are actionable. Connection-level failures are
+**not** echoed (they name the server and its credentials); the caller gets a generic message and the
+real one goes to `var/log/magebit_mcp.log`.
 
 ## Configuration reference
 
-Stores → Configuration → Magebit → MCP Server → **MCP Database Reader** (`magebit_mcp/db_tools/*`),
-gated by `Magebit_Mcp::config`.
+Stores → Configuration → Magebit → **MCP Server - Database Reader** (`magebit_mcp_db_tools/general/*`),
+gated by its own ACL resource, `Magebit_McpDbTools::config`.
 
 | Field | Path | Default | Purpose |
 |---|---|---|---|
 | Enable Read-Only SQL Tool | `enabled` | `No` | Master switch. Off means `db.query` never runs and no connection is opened. |
-| Default Row Limit | `default_rows` | `100` | Row cap when a call requests none. Clamped down to the ceiling if it is set higher. |
-| Maximum Row Limit | `row_limit_ceiling` | `1000` | Hard ceiling. The bulk-extraction brake — raising it directly raises how much one call can pull out. |
-| Statement Timeout (seconds) | `statement_timeout_seconds` | `10` | Server-side time budget per query, and the only bound on query work. |
-| Allowed Tables | `allowed_tables` | *(empty)* | The only tables the tool may read, one bare name per line. Empty refuses every query. |
-| Additional Denied Tables | `extra_denied_tables` | *(empty)* | Names protected on top of the allowlist, matched widely. Rarely needed; can only remove access. |
+| Default Row Limit | `default_rows` | `100` | Row cap when a call requests none. Clamped to the ceiling. Accepts `1`–`100000`. |
+| Maximum Row Limit | `row_limit_ceiling` | `1000` | Hard ceiling — the bulk-extraction brake. Raising it raises how much one call can pull out. Accepts `1`–`100000`. |
+| Statement Timeout (seconds) | `statement_timeout_seconds` | `10` | Server-side time budget per query, and the only bound on query work. Accepts `1`–`3600`. |
+| Allowed Tables | `allowed_tables` | *(empty)* | The only tables the tool may read, one bare name per line. Empty refuses every query. Entries are validated on save: a malformed or permanently protected name is refused in the admin rather than refusing every query later. |
+| Additional Denied Tables | `extra_denied_tables` | *(empty)* | Names protected on top of the allowlist, matched widely. Can only remove access. Validated for shape on save; naming a protected table here is allowed. |
+| Table Permission Map | `table_acl_map` | *(empty)* | The admin ACL resource each table takes to read, one `table:Vendor_Module::resource` per line. Every named table must have one — a query naming an unmapped table is refused, so the map is a second list to fill in alongside the allowlist. A line whose resource is not a `Vendor_Module::resource` id is ignored, and therefore refuses too. |
 
-Blank or non-positive numeric values fall back to the defaults above, so a cleared field can never
-widen a cap.
+Blank or non-positive numeric values fall back to the defaults, so a cleared field can never widen a
+cap.
 
 ## Troubleshooting
 
 | Symptom | Cause |
 |---|---|
-| Every query refused, message names `allowed_tables` | The allowlist is empty (the shipped default) or one line in it is malformed. Fix the named line. |
+| Every query refused, message names `allowed_tables` | The allowlist is empty (the default) or one line is malformed. Fix the named line. |
 | "…is permanently protected and can never be read" | The allowlist names something in the protected set. Remove that line. |
 | Every query refused, message names `max_execution_time` / `max_statement_time` | The connection cannot accept `SET SESSION` — usually a DB proxy. See [Deployment caveats](#deployment-caveats). |
-| `-32004 FORBIDDEN` | The token's admin role lacks `Magebit_McpDbTools::tool_db_query`, or the token was created with `--scope` values that do not include `db.query`. |
-| A refusal naming a table the query never mentioned | The wide protected/column matching fired on an identifier containing a protected word run — `admin_user_id`, `session_id`, a table called `token_registry`. Fail-closed by design; rename the alias or select different columns. |
+| `-32004 FORBIDDEN` | The token's admin role lacks `Magebit_McpDbTools::tool_db_query`, one of the resources the named tables map to, or the token was scoped without `db.query`. |
+| "These tables have no admin ACL mapping" | A named table has no line in `table_acl_map`. Add `table:Vendor_Module::resource` for it, or drop it from the allowlist. |
+| A refusal naming a table the query never mentioned | Wide protected/column matching fired on an identifier containing a protected word run — `admin_user_id`, `session_id`, a table called `token_registry`. Fail-closed by design. |
 | `SUM(qty * price)` refused | The no-`*` rule. Return `qty` and `price` and multiply client-side. |
 | A column exists but is refused | The column deny-list. Select only what you need. |
 
 `var/log/magebit_mcp.log` carries anything the tool could not do quietly: a lost `sql_mode` pin, a
-failed buffering switch, a dropped cursor, a withheld driver message, and the `critical` line when
-no statement timeout could be applied.
-
----
+failed buffering switch, a dropped cursor, a withheld driver message, and the `critical` line when no
+statement timeout could be applied.
 
 ## Extending
 
 The protected set is designed to be extended by other modules — see
 [`docs/EXTENDING.md`](docs/EXTENDING.md).
-
-## A closing warning
-
-`db.query` gives its holder read access to every table an administrator has allowlisted, in any
-shape the guard accepts, up to the row cap. The protected set keeps credentials, sessions and
-configuration secrets out of reach; nothing keeps customer names, e-mail addresses, order history
-or cart contents out of reach if those tables are listed.
-
-**Grant `Magebit_McpDbTools::tool_db_query` only to roles you would trust with direct database read
-access** — and grant `Magebit_Mcp::config`, which is what lets someone turn this on in the first
-place, with the same care.

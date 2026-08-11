@@ -12,31 +12,9 @@ use Magebit\McpDbTools\Model\Config\DbToolsConfig;
 use Magento\Framework\Exception\LocalizedException;
 
 /**
- * Which tables the SQL tool may read. Two layers, and the order between them is the point:
- *
- * 1. **Protected set** — never readable, whatever else says otherwise. Injected as the
- *    `protectedTables` / `protectedPrefixedIdentifiers` / `protectedIdentifiers` DI array arguments
- *    from this module's own `etc/di.xml`, deliberately neither a constant nor admin config. Weakening the set therefore
- *    requires filesystem write access plus `setup:di:compile`, putting it out of reach of an
- *    admin-panel user, a stolen admin session, and anything the MCP surface itself can reach —
- *    while a project or satellite module can still *extend* it (its own credential tables) with a
- *    di.xml merge instead of patching this module. A constant would block that legitimate
- *    extension; admin config would make the protected set weakenable by exactly the actor it
- *    protects against.
- * 2. **Allowlist** — `magebit_mcp/db_tools/allowed_tables`, empty by default, so a freshly enabled
- *    tool refuses every query until an operator names the tables it may read. A denylist defaults
- *    to *readable* for every table a future extension adds and rots as upstream renames things,
- *    which is why the primary control is this way round.
- *
- * The caller runs the protected check *and* the allow check — never one instead of the other, so
- * an allowlist entry can never re-open a protected name. Two matchers exist for a reason; see
- * {@see IdentifierMatcher}. Allow decisions use the narrow one only.
- *
- * Config-time sanity is enforced in {@see assertUsableAllowlist()}: a protected name spelled
- * exactly (or with this install's table prefix) in the allowlist is a hard refusal that names the
- * offending line, never a silently dropped entry. Entries that would be caught by the *wider*
- * protected matching (`custom_admin_user_map` for `admin_user`) stay legal at config time and are
- * refused per query by the veto instead, so this class never guesses at intent.
+ * Which tables the SQL tool may read: a protected set vetoing a default-empty allowlist. The
+ * protected floor is a class constant, so a di.xml merge can only ever add to it; callers must run
+ * *both* checks, and allow decisions use only the narrow {@see IdentifierMatcher}.
  */
 class TableAccessPolicy
 {
@@ -44,6 +22,66 @@ class TableAccessPolicy
      * A bare, unqualified identifier — the only shape an allowlist entry may take.
      */
     private const ENTRY_PATTERN = '/^[a-z0-9_$]+$/';
+
+    /**
+     * Word-run matched, so wrapper tables are caught too. In code rather than `di.xml` because
+     * Magento merges array arguments by item name: a downstream module re-declaring `core_config_data`
+     * would otherwise replace that entry and silently drop it from the protected set.
+     *
+     * @var list<string>
+     */
+    private const PROTECTED_TABLES_FLOOR = [
+        'admin_user',
+        'admin_passwords',
+        'admin_user_session',
+        'admin_user_expiration',
+        'oauth_token',
+        'oauth_consumer',
+        'oauth_token_request_log',
+        'magebit_mcp_token',
+        'magebit_mcp_oauth_client',
+        'magebit_mcp_oauth_auth_code',
+        'magebit_mcp_oauth_refresh_token',
+        // In-flight authorizations: params_json carries client_id, redirect_uri, state,
+        // code_challenge and scope, none of which the column deny-list can see.
+        'magebit_mcp_oauth_authorize_handoff',
+        // This tool's own audit trail holds unredacted SQL, literals included, so allowlisting it
+        // would let one operator read another operator's queries.
+        'magebit_mcp_audit_log',
+        'persistent_session',
+        // Credential-bearing; belongs with oauth_token on principle, even though the column
+        // deny-list already catches its token columns.
+        'admin_adobe_ims_webapi',
+        'password_reset_request_event',
+        // Admin two-factor secrets: `encoded_config` holds the TOTP shared secret, which is the
+        // second factor for every admin account.
+        'tfa_user_config',
+        // Encrypted payment-gateway credentials and API keys; system.config.get redacts them.
+        'core_config_data',
+    ];
+
+    /**
+     * Exact or table-prefixed: common single words where word-run matching would refuse ordinary
+     * columns.
+     *
+     * @var list<string>
+     */
+    private const PROTECTED_PREFIXED_FLOOR = ['session', 'cache', 'cache_tag'];
+
+    /**
+     * Strict equality only: server-owned words that word-run matching would over-deny.
+     *
+     * @var list<string>
+     */
+    private const PROTECTED_IDENTIFIERS_FLOOR = [
+        'mysql',
+        'information_schema',
+        'performance_schema',
+        'sys',
+        'processlist',
+        'innodb_trx',
+        'user_privileges',
+    ];
 
     /**
      * @var list<string>|null
@@ -58,13 +96,11 @@ class TableAccessPolicy
     /**
      * @param DbToolsConfig $config
      * @param IdentifierMatcher $matcher
-     * @param array<array-key, string> $protectedTables Word-run matched: multi-word names whose
-     *        wrappers (`custom_admin_user_map`) must be caught too.
-     * @param array<array-key, string> $protectedIdentifiers Matched by strict equality only:
-     *        server-owned single words (`mysql`, `sys`) that word-run matching would over-deny.
-     * @param array<array-key, string> $protectedPrefixedIdentifiers Matched exactly or behind this
-     *        install's table prefix: Magento tables whose names are single common words
-     *        (`session`, `cache`), where word-run matching would refuse ordinary columns.
+     * @param array<array-key, string> $protectedTables Added to {@see self::PROTECTED_TABLES_FLOOR}.
+     * @param array<array-key, string> $protectedIdentifiers Added to
+     *        {@see self::PROTECTED_IDENTIFIERS_FLOOR}.
+     * @param array<array-key, string> $protectedPrefixedIdentifiers Added to
+     *        {@see self::PROTECTED_PREFIXED_FLOOR}.
      */
     public function __construct(
         private readonly DbToolsConfig $config,
@@ -87,19 +123,32 @@ class TableAccessPolicy
     {
         $lower = strtolower($identifier);
 
-        foreach ($this->protectedIdentifiers as $term) {
+        foreach ($this->protectedIdentifiers() as $term) {
             if ($lower === strtolower($term)) {
                 return $lower;
             }
         }
 
-        foreach ($this->protectedPrefixedIdentifiers as $term) {
+        foreach ($this->protectedPrefixedIdentifiers() as $term) {
             if ($this->matcher->matchesExactOrPrefixed($lower, $term)) {
                 return strtolower($term);
             }
         }
 
         return $this->matcher->findWordRunMatch($lower, $this->getProtectedTerms());
+    }
+
+    /**
+     * Whether a configured entry has the only shape the policy can ever match. Shared with the
+     * admin backend models so save-time and run-time agree on what is well formed.
+     *
+     * @param string $entry
+     * @return bool
+     */
+    public function isValidEntry(string $entry): bool
+    {
+        // `=== 1` rather than `!== 0`: a PCRE failure must refuse, not wave the entry through.
+        return preg_match(self::ENTRY_PATTERN, $entry) === 1;
     }
 
     /**
@@ -115,8 +164,8 @@ class TableAccessPolicy
             throw new LocalizedException(
                 __(
                     'No tables are allowed for reading, so no query can run. List the tables this tool '
-                    . 'may read, one per line, under Stores > Configuration > Magebit > MCP Server > '
-                    . 'MCP Database Reader > Allowed Tables (%1).',
+                    . 'may read, one per line, under Stores > Configuration > Magebit > '
+                    . 'MCP Server - Database Reader > MCP Database Reader > Allowed Tables (%1).',
                     DbToolsConfig::XML_PATH_ALLOWED_TABLES
                 )
             );
@@ -160,8 +209,7 @@ class TableAccessPolicy
             $entries = $this->config->getAllowedTables();
 
             foreach ($entries as $entry) {
-                // `!== 1` rather than `=== 0`: a PCRE failure must refuse, not wave the entry through.
-                if (preg_match(self::ENTRY_PATTERN, $entry) !== 1) {
+                if (!$this->isValidEntry($entry)) {
                     throw new LocalizedException(
                         __(
                             'The Allowed Tables entry `%1` is not a plain table name. List one bare table '
@@ -198,7 +246,11 @@ class TableAccessPolicy
     {
         if ($this->protectedTerms === null) {
             $terms = [];
-            $declared = array_merge(array_values($this->protectedTables), $this->config->getExtraDeniedTables());
+            $declared = array_merge(
+                self::PROTECTED_TABLES_FLOOR,
+                array_values($this->protectedTables),
+                $this->config->getExtraDeniedTables()
+            );
             foreach ($declared as $term) {
                 $term = strtolower(trim($term));
                 if ($term !== '') {
@@ -213,6 +265,29 @@ class TableAccessPolicy
     }
 
     /**
+     * The shipped floor plus whatever di.xml added. Merged here so no read path can see one without
+     * the other.
+     *
+     * @return list<string>
+     */
+    private function protectedIdentifiers(): array
+    {
+        return array_values(array_unique(
+            array_merge(self::PROTECTED_IDENTIFIERS_FLOOR, array_values($this->protectedIdentifiers))
+        ));
+    }
+
+    /**
+     * @return list<string>
+     */
+    private function protectedPrefixedIdentifiers(): array
+    {
+        return array_values(array_unique(
+            array_merge(self::PROTECTED_PREFIXED_FLOOR, array_values($this->protectedPrefixedIdentifiers))
+        ));
+    }
+
+    /**
      * Exact / prefixed match of an allowlist entry against the protected set, for the config-time
      * sanity check only. Deliberately narrower than {@see findProtectedIdentifier()}.
      *
@@ -221,13 +296,13 @@ class TableAccessPolicy
      */
     private function findProtectedEntry(string $entry): ?string
     {
-        foreach ($this->protectedIdentifiers as $term) {
+        foreach ($this->protectedIdentifiers() as $term) {
             if (strtolower($entry) === strtolower($term)) {
                 return strtolower($term);
             }
         }
 
-        foreach ($this->protectedPrefixedIdentifiers as $term) {
+        foreach ($this->protectedPrefixedIdentifiers() as $term) {
             if ($this->matcher->matchesExactOrPrefixed($entry, $term)) {
                 return strtolower($term);
             }

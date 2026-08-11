@@ -11,17 +11,24 @@ namespace Magebit\McpDbTools\Model\Config;
 use Magento\Framework\App\Config\ScopeConfigInterface;
 
 /**
- * Reader for every `magebit_mcp/db_tools/*` store-config value. Each getter falls back to a
- * safe built-in default so a blank or malformed field can never widen the caps.
+ * Reader for every `magebit_mcp_db_tools/general/*` store-config value. Each getter falls back to
+ * a safe built-in default so a blank or malformed field can never widen the caps.
  */
 class DbToolsConfig
 {
-    public const XML_PATH_ENABLED = 'magebit_mcp/db_tools/enabled';
-    public const XML_PATH_DEFAULT_ROWS = 'magebit_mcp/db_tools/default_rows';
-    public const XML_PATH_ROW_LIMIT_CEILING = 'magebit_mcp/db_tools/row_limit_ceiling';
-    public const XML_PATH_STATEMENT_TIMEOUT_SECONDS = 'magebit_mcp/db_tools/statement_timeout_seconds';
-    public const XML_PATH_ALLOWED_TABLES = 'magebit_mcp/db_tools/allowed_tables';
-    public const XML_PATH_EXTRA_DENIED_TABLES = 'magebit_mcp/db_tools/extra_denied_tables';
+    public const XML_PATH_ENABLED = 'magebit_mcp_db_tools/general/enabled';
+    public const XML_PATH_DEFAULT_ROWS = 'magebit_mcp_db_tools/general/default_rows';
+    public const XML_PATH_ROW_LIMIT_CEILING = 'magebit_mcp_db_tools/general/row_limit_ceiling';
+    public const XML_PATH_STATEMENT_TIMEOUT_SECONDS = 'magebit_mcp_db_tools/general/statement_timeout_seconds';
+    public const XML_PATH_ALLOWED_TABLES = 'magebit_mcp_db_tools/general/allowed_tables';
+    public const XML_PATH_EXTRA_DENIED_TABLES = 'magebit_mcp_db_tools/general/extra_denied_tables';
+    public const XML_PATH_TABLE_ACL_MAP = 'magebit_mcp_db_tools/general/table_acl_map';
+
+    /**
+     * The only shape an ACL resource id can have. Anything else could never resolve, so a line
+     * carrying it is dropped and its table stays unmapped — and therefore refused.
+     */
+    private const ACL_RESOURCE_PATTERN = '/^[A-Za-z0-9_]+::[A-Za-z0-9_]+$/';
 
     public const DEFAULT_ROWS = 100;
     public const DEFAULT_ROW_LIMIT_CEILING = 1000;
@@ -92,6 +99,39 @@ class DbToolsConfig
     public function getExtraDeniedTables(): array
     {
         return $this->readTableList(self::XML_PATH_EXTRA_DENIED_TABLES);
+    }
+
+    /**
+     * Table name to the admin ACL resource a caller must hold to read it, one `table:resource` per
+     * line. Shipped empty, so no table is readable until an operator says which permission it takes.
+     *
+     * @return array<string, string>
+     */
+    public function getTableAclMap(): array
+    {
+        $raw = $this->scopeConfig->getValue(self::XML_PATH_TABLE_ACL_MAP);
+        if (!is_string($raw) || trim($raw) === '') {
+            return [];
+        }
+
+        $map = [];
+        foreach (preg_split('/\r\n|\r|\n/', $raw) ?: [] as $line) {
+            $line = trim($line);
+            $separator = strpos($line, ':');
+            if ($line === '' || str_starts_with($line, '#') || $separator === false) {
+                continue;
+            }
+
+            $table = strtolower(trim(substr($line, 0, $separator), " \t`\"'"));
+            $resource = trim(substr($line, $separator + 1));
+            if ($table === '' || preg_match(self::ACL_RESOURCE_PATTERN, $resource) !== 1) {
+                continue;
+            }
+
+            $map[$table] = $resource;
+        }
+
+        return $map;
     }
 
     /**

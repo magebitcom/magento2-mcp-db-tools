@@ -2,8 +2,8 @@
 <config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
         xsi:noNamespaceSchemaLocation="urn:magento:module:Magento_Store:etc/config.xsd">
     <default>
-        <magebit_mcp>
-            <db_tools>
+        <magebit_mcp_db_tools>
+            <general>
                 <!-- Off by default: installing this module must never widen the attack surface on its own. -->
                 <enabled>0</enabled>
                 <default_rows>100</default_rows>
@@ -16,7 +16,13 @@
 # See the field comment in the admin for a starter list you can paste and trim.</allowed_tables>
                 <extra_denied_tables># One table name per line. Lines starting with # are ignored.
 # Listed tables are protected on top of the allowlist and can never be read.</extra_denied_tables>
-            </db_tools>
-        </magebit_mcp>
+                <!-- Empty on purpose: a table with no line here is refused, so shipping a mapping
+                     would be the one thing that could widen access without an operator deciding to. -->
+                <table_acl_map># One table:resource per line. Lines starting with # are ignored.
+# Each line names the admin ACL resource a caller must hold to read that table, e.g.
+# sales_order:Magento_Sales::sales_order
+# A table with no line here is refused — the tool cannot tell who may read it.</table_acl_map>
+            </general>
+        </magebit_mcp_db_tools>
     </default>
 </config>

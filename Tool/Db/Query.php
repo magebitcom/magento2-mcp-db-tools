@@ -8,10 +8,10 @@ declare(strict_types=1);
 
 namespace Magebit\McpDbTools\Tool\Db;
 
+use Magebit\Mcp\Api\ContextualAclAwareInterface;
 use Magebit\Mcp\Api\LoggerInterface;
 use Magebit\Mcp\Api\ToolInterface;
 use Magebit\Mcp\Api\ToolResultInterface;
-use Magebit\Mcp\Api\UnderlyingAclAwareInterface;
 use Magebit\Mcp\Model\Tool\Schema\Builder\IntegerBuilder;
 use Magebit\Mcp\Model\Tool\Schema\Builder\StringBuilder;
 use Magebit\Mcp\Model\Tool\Schema\Schema;
@@ -19,75 +19,25 @@ use Magebit\Mcp\Model\Tool\ToolResult;
 use Magebit\Mcp\Model\Tool\WriteMode;
 use Magebit\McpDbTools\Model\Config\DbToolsConfig;
 use Magebit\McpDbTools\Model\QueryGuard;
+use Magebit\McpDbTools\Model\Sql\Lexer;
+use Magebit\McpDbTools\Model\Sql\TableReferenceScanner;
+use Magebit\McpDbTools\Model\TableAclMap;
 use Magento\Framework\App\ResourceConnection;
 use Magento\Framework\DB\Adapter\AdapterInterface;
 use Magento\Framework\Exception\LocalizedException;
 use Throwable;
 
-/**
- * `db.query` — runs one operator-supplied read-only statement and returns its rows.
- *
- * This class is deliberately thin: every decision about *what may run* belongs to
- * {@see QueryGuard}, and the string the guard returns is executed **verbatim**, so the form that
- * was validated is the form the server sees. The order below is part of the security contract:
- *
- * 1. the `magebit_mcp/db_tools/enabled` gate, before the connection is touched at all;
- * 2. `{{table_name}}` substitution — mandatory, because leftover braces are a hard rejection
- *    inside the guard, so a wiring mistake surfaces as an actionable message instead of a
- *    mysterious SQL error;
- * 3. `QueryGuard::assertReadOnly()`, whose messages (including the configuration-level ones about
- *    the Allowed Tables list) are surfaced to the operator unchanged — they name the offending
- *    entry and the config field, which is what makes them actionable;
- * 4. the session guards: a statement timeout and a pinned `sql_mode`, both built from our own
- *    literals and never from user input. The timeout is load-bearing rather than decorative: the
- *    guard bounds the *shape* of a query and the number of rows returned, not the work done, so an
- *    unbounded cross join or a wide hashing scan is limited only by this — which is why a server
- *    that accepts neither timeout variable gets the query refused rather than run unbounded;
- * 5. **streamed** execution: result buffering is switched off for the duration of the read (Magento
- *    turns it on at connect time, which makes the driver materialise the whole set inside PHP before
- *    the first row can be inspected), rows are pulled one at a time, and the read stops at the byte
- *    budget. The guard's row cap bounds the number of rows, never their width, so this is the only
- *    bound on how much a single query can pull into the process. Buffering is restored, and the
- *    cursor closed, on every exit path — an unbuffered cursor left open would break the next query
- *    on the shared connection, the audit-log insert included.
- *
- * **Audit note:** the executed SQL is written to `magebit_mcp_audit_log` verbatim (capped at
- * {@see self::AUDIT_SQL_LENGTH} characters) and is *not* PII-redacted, because it is SQL rather
- * than a named argument. A query such as `… WHERE email = 'a@b.com'` therefore leaves that literal
- * in the audit row. That is intentional — an audit trail for raw SQL access is worth little without
- * the statement — but it means the audit table inherits the sensitivity of the queries run.
- */
-class Query implements ToolInterface, UnderlyingAclAwareInterface
+class Query implements ToolInterface, ContextualAclAwareInterface
 {
     public const TOOL_NAME = 'db.query';
     public const ACL_RESOURCE = 'Magebit_McpDbTools::tool_db_query';
 
-    /**
-     * Ceiling on the serialised response. A row cap alone does not bound bytes: one row of
-     * concatenated `TEXT` columns can be megabytes on its own.
-     */
     public const MAX_PAYLOAD_BYTES = 1048576;
-
-    /**
-     * Bytes held back from {@see self::MAX_PAYLOAD_BYTES} for the response's own scaffolding
-     * (keys, flags, and the echoed SQL) so the trimmed payload still fits the cap.
-     */
     private const PAYLOAD_OVERHEAD_BYTES = 1024;
-
     private const AUDIT_SQL_LENGTH = 1000;
-
-    /**
-     * Cap on how much of a driver message is echoed back to the caller.
-     */
     private const DRIVER_MESSAGE_LENGTH = 500;
 
     /**
-     * Failure classes whose message may be shown to the caller: they describe *this statement*
-     * (unknown column, missing table, lock wait, deadlock) and carry nothing about the
-     * infrastructure. An allowlist rather than a deny-list, so an unfamiliar failure class is
-     * summarised instead of echoed — connection-level messages name the DB account and the
-     * application host (`Access denied for user 'magento'@'10.1.0.10'`).
-     *
      * @var list<class-string<Throwable>>
      */
     private const ECHOABLE_FAILURES = [
@@ -116,12 +66,18 @@ class Query implements ToolInterface, UnderlyingAclAwareInterface
      * @param QueryGuard $queryGuard
      * @param ResourceConnection $resourceConnection
      * @param LoggerInterface $logger
+     * @param Lexer $lexer
+     * @param TableReferenceScanner $tableScanner
+     * @param TableAclMap $tableAclMap
      */
     public function __construct(
         private readonly DbToolsConfig $config,
         private readonly QueryGuard $queryGuard,
         private readonly ResourceConnection $resourceConnection,
-        private readonly LoggerInterface $logger
+        private readonly LoggerInterface $logger,
+        private readonly Lexer $lexer,
+        private readonly TableReferenceScanner $tableScanner,
+        private readonly TableAclMap $tableAclMap
     ) {
     }
 
@@ -191,7 +147,9 @@ class Query implements ToolInterface, UnderlyingAclAwareInterface
             . '`TRIM(LEADING \'0\' FROM col)`, `SUBSTRING(col FROM 2 FOR 3)`, '
             . '`POSITION(\'x\' IN col)`.'
             . "\n- Also refused: `@`/`@@` variables, `INTO OUTFILE`, `SLEEP`/`BENCHMARK`/"
-            . '`GET_LOCK`, `/*! */` executable comments, references to any other database, the '
+            . '`GET_LOCK`, `/*! */`/`/*M! */` executable comments, `CURRENT_USER`/`CURRENT_ROLE`/'
+            . '`SESSION_USER`/`SYSTEM_USER` (with or without parentheses — they report the '
+            . 'connecting account), references to any other database, the '
             . 'table-value constructors `TABLE t` and `VALUES ROW(…)` (write `SELECT <columns> FROM '
             . 't` instead), `NEXT VALUE FOR`/`PREVIOUS VALUE FOR`, and schema-qualified function '
             . 'calls such as `db.count(1)`.'
@@ -215,16 +173,14 @@ class Query implements ToolInterface, UnderlyingAclAwareInterface
                     'The SQL statement to run. Single statement, read-only, explicit columns. '
                     . 'Use `{{table_name}}` for table names so the store\'s table prefix is applied.'
                 )
-                ->required()
-            )
+                ->required())
             ->integer('limit', fn (IntegerBuilder $i) => $i
                 ->minimum(1)
                 ->maximum($this->config->getRowLimitCeiling())
                 ->description(
                     'Row cap, used only when the statement carries no LIMIT of its own. '
                     . 'Defaults to the store\'s configured default row limit.'
-                )
-            )
+                ))
             ->toArray();
     }
 
@@ -237,16 +193,32 @@ class Query implements ToolInterface, UnderlyingAclAwareInterface
     }
 
     /**
-     * No admin-UI screen runs arbitrary SQL, so there is no underlying Magento resource that could
-     * express "the admin UI can already do this" — the `enabled` config flag plus the dedicated
-     * `tool_db_query` ACL are the whole gate. Returning a stand-in resource here would either
-     * widen access (a broad one) or misdescribe the capability (a narrow one).
+     * The admin resources the named tables require, so raw SQL cannot read what the domain tools
+     * would refuse. Runs before schema validation, so it tolerates anything and never throws.
      *
-     * @return string|null
+     * @param array $arguments
+     * @phpstan-param array<string, mixed> $arguments
+     * @return array<int, string>
      */
-    public function getUnderlyingAclResource(): ?string
+    public function getContextualAclResources(array $arguments): array
     {
-        return null;
+        $query = $arguments['query'] ?? null;
+        if (!is_string($query) || trim($query) === '') {
+            return [];
+        }
+
+        // Runs before schema validation, so the length cap has not applied yet; execute() refuses
+        // an over-long query anyway, so there is nothing to gain from lexing it here.
+        if (strlen($query) > self::MAX_QUERY_LENGTH) {
+            return [];
+        }
+
+        try {
+            return $this->tableAclMap->resolve($this->readTables($this->substituteTablePlaceholders($query)));
+        } catch (Throwable) {
+            // Malformed input is expected this early; execute() refuses what cannot be resolved.
+            return [];
+        }
     }
 
     /**
@@ -274,11 +246,18 @@ class Query implements ToolInterface, UnderlyingAclAwareInterface
 
         $sql = $this->substituteTablePlaceholders($this->readQuery($arguments));
         $executable = $this->queryGuard->assertReadOnly($sql, $this->readLimit($arguments));
+        $this->assertEveryTableIsMapped($executable);
 
         $connection = $this->resourceConnection->getConnection();
-        $this->applySessionGuards($connection);
+        $sessionState = $this->captureSessionState($connection);
 
-        $result = $this->streamRows($connection, $executable);
+        try {
+            $this->applySessionGuards($connection);
+            $result = $this->streamRows($connection, $executable);
+        } finally {
+            $this->restoreSessionState($connection, $sessionState);
+        }
+
         $limitApplied = $this->queryGuard->findRowLimit($executable);
         $rowCount = count($result['rows']);
 
@@ -313,10 +292,54 @@ class Query implements ToolInterface, UnderlyingAclAwareInterface
         throw new LocalizedException(
             __(
                 'The read-only SQL tool is turned off. An administrator has to enable it under '
-                . 'Stores > Configuration > Magebit > MCP Server > MCP Database Reader > '
-                . 'Enable Read-Only SQL Tool (%1).',
+                . 'Stores > Configuration > Magebit > MCP Server - Database Reader > MCP Database Reader '
+                . '> Enable Read-Only SQL Tool (%1).',
                 DbToolsConfig::XML_PATH_ENABLED
             )
+        );
+    }
+
+    /**
+     * The gate the contextual ACL check cannot close on its own: an unmapped table resolves to no
+     * resource, and the dispatcher reads that as "no opinion" rather than as a denial.
+     *
+     * @param string $executable Already accepted by the guard, so re-reading it cannot fail.
+     * @return void
+     * @throws LocalizedException
+     */
+    private function assertEveryTableIsMapped(string $executable): void
+    {
+        $unmapped = $this->tableAclMap->unmapped($this->readTables($executable));
+        if ($unmapped === []) {
+            return;
+        }
+
+        throw new LocalizedException(
+            __(
+                'These tables have no admin ACL mapping, so the tool cannot check whether the '
+                . 'caller may read them: %1. Add a `table:Magento_Module::resource` line for each '
+                . 'under %2, or remove them from the allowlist.',
+                implode(', ', $unmapped),
+                DbToolsConfig::XML_PATH_TABLE_ACL_MAP
+            )
+        );
+    }
+
+    /**
+     * Names of the tables $sql reads. Schema qualifiers are dropped: the guard already refuses every
+     * reference to another database, and dropping one can only ever widen what the caller must hold.
+     *
+     * @param string $sql
+     * @return list<string>
+     * @throws LocalizedException
+     */
+    private function readTables(string $sql): array
+    {
+        $lexed = $this->lexer->tokenize($sql);
+
+        return $this->tableScanner->extractTables(
+            $lexed['tokens'],
+            strtoupper((string) ($lexed['tokens'][0]['value'] ?? ''))
         );
     }
 
@@ -394,9 +417,7 @@ class Query implements ToolInterface, UnderlyingAclAwareInterface
         $mysqlForm = 'SET SESSION max_execution_time = ' . ($seconds * 1000);
         $mariaDbForm = 'SET SESSION max_statement_time = ' . $seconds;
 
-        // Ordered by server flavour, not tried blindly: MariaDB has no `max_execution_time` and
-        // MySQL has no `max_statement_time`, so probing in the wrong order would log a failure on
-        // every healthy call and drown the one case that matters.
+        // Flavour-ordered: the wrong order logs a failure on every healthy call.
         $forms = $this->isMariaDb($connection) ? [$mariaDbForm, $mysqlForm] : [$mysqlForm, $mariaDbForm];
         $failures = [];
 
@@ -410,23 +431,7 @@ class Query implements ToolInterface, UnderlyingAclAwareInterface
                     );
                 }
 
-                // `sql_mode`: `NO_BACKSLASH_ESCAPES` makes the server's literal boundaries match the
-                // guard's, which refuses backslashes outright. Appended rather than assigned — this
-                // is the shared request connection, so replacing the mode set would change
-                // behaviour for everything else running on it.
-                $sqlModeFailure = $this->tryStatement(
-                    $connection,
-                    "SET SESSION sql_mode = CONCAT(@@SESSION.sql_mode, ',NO_BACKSLASH_ESCAPES')"
-                );
-                if ($sqlModeFailure !== null) {
-                    // Deliberately no `SET SESSION sql_mode = '…'` fallback: assigning would drop
-                    // modes such as STRICT_TRANS_TABLES for the rest of the request. Skipping the
-                    // pin is safe — the guard refuses backslashes and `"` whatever the mode is.
-                    $this->logger->warning(
-                        'db.query could not pin sql_mode; continuing without the pin.',
-                        ['exception' => $sqlModeFailure]
-                    );
-                }
+                $this->pinSqlMode($connection);
 
                 return;
             }
@@ -447,6 +452,94 @@ class Query implements ToolInterface, UnderlyingAclAwareInterface
                 . 'the database indefinitely.',
                 $seconds
             )
+        );
+    }
+
+    /**
+     * `NO_BACKSLASH_ESCAPES` aligns the server's literal boundaries with the guard's. Appended
+     * rather than assigned: this is the shared request connection.
+     *
+     * @param AdapterInterface $connection
+     * @return void
+     */
+    private function pinSqlMode(AdapterInterface $connection): void
+    {
+        $failure = $this->tryStatement(
+            $connection,
+            "SET SESSION sql_mode = CONCAT(@@SESSION.sql_mode, ',NO_BACKSLASH_ESCAPES')"
+        );
+
+        if ($failure !== null) {
+            // No assignment fallback on purpose: it would drop STRICT_TRANS_TABLES for the rest of
+            // the request. Safe to skip — the guard refuses `\` and `"` regardless.
+            $this->logger->warning(
+                'db.query could not pin sql_mode; continuing without the pin.',
+                ['exception' => $failure]
+            );
+        }
+    }
+
+    /**
+     * Reads the session values the guards are about to overwrite. Null means they could not be read,
+     * in which case nothing is restored — writing a guessed value would be worse than leaving ours.
+     *
+     * @param AdapterInterface $connection
+     * @return array{sql_mode: string, timeout_variable: string, timeout_value: string}|null
+     */
+    private function captureSessionState(AdapterInterface $connection): ?array
+    {
+        $variable = $this->isMariaDb($connection) ? 'max_statement_time' : 'max_execution_time';
+
+        try {
+            $row = $connection->fetchRow(
+                sprintf('SELECT @@SESSION.sql_mode AS m, @@SESSION.%s AS t', $variable)
+            );
+        } catch (Throwable $exception) {
+            $this->logger->warning(
+                'db.query could not read session state, so it will not be restored.',
+                ['exception' => $exception->getMessage()]
+            );
+
+            return null;
+        }
+
+        if (!is_array($row) || !isset($row['m'], $row['t']) || !is_scalar($row['m']) || !is_scalar($row['t'])) {
+            return null;
+        }
+
+        return [
+            'sql_mode' => (string) $row['m'],
+            'timeout_variable' => $variable,
+            'timeout_value' => (string) $row['t'],
+        ];
+    }
+
+    /**
+     * Puts the shared connection back the way it was found. Runs after the streamed read, so the
+     * timeout still bounds the whole call.
+     *
+     * @param AdapterInterface $connection
+     * @param array{sql_mode: string, timeout_variable: string, timeout_value: string}|null $state
+     * @return void
+     */
+    private function restoreSessionState(AdapterInterface $connection, ?array $state): void
+    {
+        if ($state === null) {
+            return;
+        }
+
+        try {
+            $quoted = $connection->quote($state['sql_mode']);
+            if (is_string($quoted)) {
+                $this->tryStatement($connection, 'SET SESSION sql_mode = ' . $quoted);
+            }
+        } catch (Throwable) {
+            // This runs from a `finally`; a quoting failure must not replace the real exception.
+        }
+
+        $this->tryStatement(
+            $connection,
+            sprintf('SET SESSION %s = %d', $state['timeout_variable'], (int) $state['timeout_value'])
         );
     }
 
@@ -486,15 +579,9 @@ class Query implements ToolInterface, UnderlyingAclAwareInterface
     }
 
     /**
-     * Reads the result set with buffering switched off for the duration, restoring it afterwards
-     * whatever happens. Without this the whole set is materialised inside PHP by the driver at
-     * `query()` time — Magento sets `MYSQL_ATTR_USE_BUFFERED_QUERY` on connect — and no cap applied
-     * afterwards can bound memory.
-     *
-     * One attempt escapes that bound: Magento retries a statement failing with MySQL 2006/2013 on a
-     * fresh connection, and `closeConnection()` leaves `_connectionFlagsSet` set, so `_connect()`
-     * skips the attribute block and the new handle keeps PDO's buffered default. The shared
-     * connection is never left unbuffered, but the retried attempt reads buffered.
+     * Reads the result set unbuffered, restoring buffering on every exit path: otherwise the driver
+     * materialises the whole set in PHP at `query()` time and no cap can bound memory. Known gap:
+     * Magento's 2006/2013 retry reads buffered (`_connectionFlagsSet` survives the reconnect).
      *
      * @param AdapterInterface $connection
      * @param string $executable
@@ -645,9 +732,8 @@ class Query implements ToolInterface, UnderlyingAclAwareInterface
 
     /**
      * An unbuffered cursor left open would fail every later query on this connection — the audit
-     * log insert included — so a cursor that will not close costs us the connection instead. Note
-     * that dropping the connection also discards any transaction open on it; only reachable when the
-     * cursor refuses to close, and an MCP call has no transaction of its own open at this point.
+     * log insert included — so a cursor that will not close costs us the connection instead. Safe
+     * to drop: an MCP call has no transaction of its own open at this point.
      *
      * @param AdapterInterface $connection
      * @param \Zend_Db_Statement_Interface $statement

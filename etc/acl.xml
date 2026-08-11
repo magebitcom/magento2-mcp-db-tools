@@ -5,12 +5,13 @@
         <resources>
             <resource id="Magento_Backend::admin">
                 <resource id="Magento_Backend::system">
-                    <resource id="Magebit_McpDbTools::mcp" title="MCP Database Reader" sortOrder="520">
-
-                        <!-- Read-only SQL. Grant to trusted operators only. -->
-                        <resource id="Magebit_McpDbTools::tool_db_query"
-                                  title="Tool: Run Read-Only SQL Query" sortOrder="10"/>
-
+                    <resource id="Magebit_Mcp::mcp">
+                        <resource id="Magebit_McpDbTools::config"
+                                  title="MCP Database Reader Configuration" sortOrder="60"/>
+                        <resource id="Magebit_Mcp::tools">
+                            <resource id="Magebit_McpDbTools::tool_db_query"
+                                      title="Tool: Run Read-Only SQL Query" sortOrder="400"/>
+                        </resource>
                     </resource>
                 </resource>
             </resource>

@@ -12,17 +12,9 @@ use Magento\Framework\App\DeploymentConfig;
 use Magento\Framework\Config\ConfigOptionsListConstants;
 
 /**
- * The two identifier-matching primitives the guard's table and column layers are built from,
- * kept side by side so the difference between them is impossible to miss.
- *
- * {@see findWordRunMatch()} is **wide**: exact, `<prefix><term>`, and "the term's words appear
- * as a contiguous run". Widening a match is fail-**closed** when the answer is used to *refuse*
- * a query, which is the only direction it may ever be used in.
- *
- * {@see matchesExactOrPrefixed()} is **narrow**: exact or `<prefix><term>` and nothing else. It
- * is the only matcher an *allow* decision may use. Word-run matching in the allow direction
- * fails open catastrophically — an allowed `customer_entity` would admit
- * `customer_entity_backup`, and an allowed bare `user` would admit `admin_user`.
+ * The guard's two identifier matchers. {@see findWordRunMatch()} is wide and may only ever be
+ * used to *refuse* (widening fails closed there); {@see matchesExactOrPrefixed()} is the only
+ * matcher an *allow* decision may use — wide matching there fails open (`user` admits `admin_user`).
  */
 class IdentifierMatcher
 {

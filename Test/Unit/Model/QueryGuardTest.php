@@ -12,6 +12,8 @@ use Magebit\McpDbTools\Model\ColumnDenyList;
 use Magebit\McpDbTools\Model\Config\DbToolsConfig;
 use Magebit\McpDbTools\Model\IdentifierMatcher;
 use Magebit\McpDbTools\Model\QueryGuard;
+use Magebit\McpDbTools\Model\Sql\Lexer;
+use Magebit\McpDbTools\Model\Sql\TableReferenceScanner;
 use Magebit\McpDbTools\Model\TableAccessPolicy;
 use Magento\Framework\App\DeploymentConfig;
 use Magento\Framework\Config\ConfigOptionsListConstants;
@@ -19,11 +21,9 @@ use Magento\Framework\Exception\LocalizedException;
 use PHPUnit\Framework\TestCase;
 
 /**
- * Bypass-focused coverage of the guard layers. Every rejection asserts on the message so a
- * refactor cannot quietly swap one layer's verdict for another's.
- *
- * The protected set is read out of the module's own `etc/di.xml`, not restated here: a test
- * copy would keep passing after someone shortened the shipped array.
+ * Bypass-focused coverage. Every rejection asserts on the message, so a refactor cannot swap one
+ * layer's verdict for another's; the protected set comes from the policy's own floor, so the guard
+ * is exercised against the set the module actually ships.
  */
 class QueryGuardTest extends TestCase
 {
@@ -80,37 +80,32 @@ class QueryGuardTest extends TestCase
         );
 
         $matcher = new IdentifierMatcher($deploymentConfig);
-        $policy = new TableAccessPolicy(
-            $config,
-            $matcher,
-            self::diArgument('protectedTables'),
-            self::diArgument('protectedIdentifiers'),
-            self::diArgument('protectedPrefixedIdentifiers')
-        );
+        // No DI arguments on purpose: the shipped protected set is the class's own floor.
+        $policy = new TableAccessPolicy($config, $matcher, [], [], []);
 
-        return new QueryGuard($config, $policy, new ColumnDenyList($matcher));
+        return new QueryGuard(
+            $config,
+            $policy,
+            new ColumnDenyList($matcher),
+            new Lexer(),
+            new TableReferenceScanner()
+        );
     }
 
     /**
-     * Reads one DI array argument of {@see TableAccessPolicy} out of the shipped `etc/di.xml`.
+     * A policy with no DI arguments at all, so only the shipped floor is in play.
      *
-     * @param string $name
-     * @return list<string>
+     * @return TableAccessPolicy
      */
-    private static function diArgument(string $name): array
+    private function floorPolicy(): TableAccessPolicy
     {
-        $xml = simplexml_load_file(__DIR__ . '/../../../etc/di.xml');
-        self::assertNotFalse($xml, 'etc/di.xml is not readable.');
-
-        $items = $xml->xpath(
-            sprintf(
-                '//type[@name="Magebit\McpDbTools\Model\TableAccessPolicy"]/arguments/argument[@name="%s"]/item',
-                $name
-            )
+        return new TableAccessPolicy(
+            $this->createMock(DbToolsConfig::class),
+            new IdentifierMatcher($this->createMock(DeploymentConfig::class)),
+            [],
+            [],
+            []
         );
-        self::assertNotEmpty($items, sprintf('di.xml declares no `%s` items.', $name));
-
-        return array_values(array_map(static fn (\SimpleXMLElement $item): string => (string) $item, $items));
     }
 
     /**
@@ -182,6 +177,29 @@ class QueryGuardTest extends TestCase
     public function testRejectsOptimizerHintComment(): void
     {
         $this->assertRejected('SELECT /*+ MAX_EXECUTION_TIME(1) */ entity_id FROM t', 'executable comment');
+    }
+
+    /**
+     * @return array<string, array{string}>
+     */
+    public static function executableCommentProvider(): array
+    {
+        return [
+            'mysql bang' => ['SELECT title FROM cms_page /*!100000 UNION SELECT 1 */'],
+            'optimizer hint' => ['SELECT /*+ MAX_EXECUTION_TIME(1) */ title FROM cms_page'],
+            'mariadb bang' => ['SELECT title FROM cms_page /*M!100000 UNION SELECT 1 */'],
+            'mariadb bang lower case' => ['SELECT title FROM cms_page /*m!100000 UNION SELECT 1 */'],
+        ];
+    }
+
+    /**
+     * @dataProvider executableCommentProvider
+     * @param string $sql
+     * @return void
+     */
+    public function testRejectsExecutableComments(string $sql): void
+    {
+        $this->assertRejected($sql, 'executable comment');
     }
 
     public function testRejectsUnterminatedBlockComment(): void
@@ -474,6 +492,40 @@ class QueryGuardTest extends TestCase
         $this->assertSame($sql . ' LIMIT 100', $this->guard()->assertReadOnly($sql));
     }
 
+    /**
+     * @return array<string, array{string}>
+     */
+    public static function parenlessServerInfoKeywordProvider(): array
+    {
+        return [
+            'CURRENT_USER' => ['SELECT CURRENT_USER'],
+            'CURRENT_ROLE' => ['SELECT CURRENT_ROLE'],
+            'SESSION_USER' => ['SELECT SESSION_USER'],
+            'SYSTEM_USER' => ['SELECT SYSTEM_USER'],
+        ];
+    }
+
+    /**
+     * These keywords leak the database account MCP connects as. The function allowlist only
+     * inspects words followed by `(`, so the parenless form must be denied outright.
+     *
+     * @dataProvider parenlessServerInfoKeywordProvider
+     * @param string $sql
+     * @return void
+     */
+    public function testRejectsParenlessServerInfoKeyword(string $sql): void
+    {
+        $this->assertRejected($sql, 'not permitted');
+    }
+
+    public function testAllowsColumnNameThatMerelyContainsAServerInfoKeywordAsASubstring(): void
+    {
+        // Keyword matching is whole-token (the lexer already groups identifier characters into one
+        // word), so a column merely containing `current_user` must stay usable.
+        $sql = 'SELECT current_user_id FROM customer_entity';
+        $this->assertSame($sql . ' LIMIT 100', $this->guard()->assertReadOnly($sql));
+    }
+
     // ------------------------------------------------ literal-boundary bypass attempts
 
     public function testRejectsDangerousCodeHiddenBehindDoubleDashLiteral(): void
@@ -576,8 +628,7 @@ class QueryGuardTest extends TestCase
 
     public function testRejectsQualifiedStoredFunctionCall(): void
     {
-        // Refused by the qualified-call rule now, which is strictly more specific: the word before
-        // the `(` need not even be unknown for a qualified name to be a stored function.
+        // The qualified-call rule is more specific: the word before `(` need not be unknown.
         $this->assertRejected('SELECT other_db.helper_totals(1) FROM customer_entity', 'schema-qualified');
     }
 
@@ -588,9 +639,8 @@ class QueryGuardTest extends TestCase
 
     public function testRejectsFunctionNamedAfterAStructuralKeyword(): void
     {
-        // A quoted word before `(` never earns the structural exemption. `ROW` rather than `VALUES`,
-        // which the keyword layer now denies outright — the quoted-flag rule still needs its own
-        // case, on a structural keyword that reaches layer 4b.
+        // A quoted word before `(` never earns the structural exemption. `ROW`, not `VALUES` — the
+        // keyword layer denies that one outright, so it cannot exercise the quoted-flag rule.
         $this->assertRejected('SELECT `row`(1) FROM customer_entity', 'not a permitted function');
         $this->assertRejected('SELECT `values`(1) FROM customer_entity', 'VALUES');
     }
@@ -614,8 +664,6 @@ class QueryGuardTest extends TestCase
             'dates' => ["SELECT DATE_FORMAT(created_at, '%Y-%m') FROM sales_order"],
             'cast with precision' => ['SELECT CAST(grand_total AS DECIMAL(12,4)) FROM sales_order'],
             'control flow' => ["SELECT IFNULL(coupon_code, '-'), IF(state = 'new', 1, 0) FROM sales_order"],
-            // `additional_information` used to stand here; it is a denied column now, so the JSON
-            // accessor is exercised on an ordinary column instead.
             'json accessor' => ["SELECT JSON_EXTRACT(extra_data, '$.x') FROM some_table"],
             'window function' => [
                 'SELECT ROW_NUMBER() OVER (PARTITION BY store_id ORDER BY entity_id) FROM sales_order',
@@ -665,8 +713,7 @@ class QueryGuardTest extends TestCase
         return [
             'admin_user' => ['SELECT c.email FROM admin_user c', 'admin_user'],
             'admin_passwords' => ['SELECT password_expires FROM admin_passwords', 'admin_passwords'],
-            // `SELECT session_id …` would now be refused by the column layer (`session_id`) before
-            // reaching the table verdict this case is about, so the column stays neutral.
+            // A neutral column, so the table verdict is what this case asserts.
             'admin_user_session' => ['SELECT user_id FROM admin_user_session', 'admin_user_session'],
             'admin_user_expiration' => ['SELECT expires_at FROM admin_user_expiration', 'admin_user_expiration'],
             'oauth_token' => ['SELECT entity_id FROM oauth_token', 'oauth_token'],
@@ -927,9 +974,7 @@ class QueryGuardTest extends TestCase
             'cc_owner' => ['SELECT cc_owner FROM sales_order_payment', 'cc_owner'],
             'cc_number_enc' => ['SELECT cc_number_enc FROM sales_order_payment', 'cc_number_enc'],
             'cc_cid_enc' => ['SELECT cc_cid_enc FROM quote_payment', 'cc_cid_enc'],
-            // The whole `cc_*` family, which is what the README and the tool description promise.
-            // `cc_last_4` is the real column name — the enumeration used to spell it `cc_last4`,
-            // which the word-run matcher can never match, so the column was readable.
+            // The whole `cc_*` family — `cc_last_4` is the real spelling.
             'cc_last_4' => ['SELECT cc_last_4 FROM sales_order_payment', 'cc'],
             'cc_type' => ['SELECT cc_type FROM sales_order_payment', 'cc'],
             'cc_exp_month' => ['SELECT cc_exp_month FROM sales_order_payment', 'cc'],
@@ -957,11 +1002,8 @@ class QueryGuardTest extends TestCase
     }
 
     /**
-     * The real column spelling each denied term exists to catch, sourced from the Magento schema
-     * (or from `mysql.user` for `authentication_string`). Adding a term without a real spelling
-     * here fails {@see testEveryDeniedColumnTermMatchesItsRealColumn}, which is what turns a
-     * mis-spelled term — the `cc_last4` / `cc_last_4` bug — into a failing test rather than a
-     * column that is silently readable.
+     * The real column spelling each denied term must catch. A term with no entry here fails
+     * {@see testEveryDeniedColumnTermMatchesItsRealColumn}.
      *
      * @var array<string, string>
      */
@@ -988,10 +1030,8 @@ class QueryGuardTest extends TestCase
     ];
 
     /**
-     * The regression test for the `cc_last4` class of bug: a term that matches no real column
-     * protects nothing while reading as protection. Executes the matcher rather than inspecting
-     * the array, and requires the term itself to be the verdict, so a term that only matches
-     * because a *different* term covers the same spelling is not counted as live.
+     * A term matching no real column protects nothing. Executes the matcher and requires the term
+     * itself to be the verdict, so coverage by a *different* term does not count as live.
      *
      * @return void
      */
@@ -1222,13 +1262,15 @@ class QueryGuardTest extends TestCase
 
     // ------------------------------------------------ the protected set is the shipped one
 
-    public function testDiXmlStillProtectsEverySeededName(): void
+    /**
+     * The floor moved from `etc/di.xml` into class constants, so the shipped set is now proved
+     * through the policy itself: a shortened floor fails here.
+     *
+     * @return void
+     */
+    public function testTheShippedFloorStillProtectsEverySeededName(): void
     {
-        $protected = array_merge(
-            self::diArgument('protectedTables'),
-            self::diArgument('protectedIdentifiers'),
-            self::diArgument('protectedPrefixedIdentifiers')
-        );
+        $policy = $this->floorPolicy();
 
         foreach (
             [
@@ -1237,15 +1279,35 @@ class QueryGuardTest extends TestCase
                 'magebit_mcp_oauth_auth_code', 'magebit_mcp_oauth_refresh_token', 'persistent_session',
                 'password_reset_request_event', 'core_config_data', 'mysql', 'information_schema',
                 'performance_schema', 'sys', 'processlist', 'innodb_trx', 'user_privileges',
-                // Added in Task 7's review round: module-owned or Magento-owned tables holding
-                // security material the MCP surface itself produces or depends on.
+                // Module- or Magento-owned tables holding security material.
                 'magebit_mcp_oauth_authorize_handoff', 'magebit_mcp_audit_log', 'session', 'cache',
                 'cache_tag', 'admin_adobe_ims_webapi',
-                // Added in the whole-module security review: admin 2FA shared secrets.
+                // Admin 2FA shared secrets.
                 'tfa_user_config',
             ] as $name
         ) {
-            $this->assertContains($name, $protected, sprintf('`%s` is no longer protected by di.xml.', $name));
+            $this->assertNotNull(
+                $policy->findProtectedIdentifier($name),
+                sprintf('`%s` is no longer in the shipped protected floor.', $name)
+            );
+        }
+    }
+
+    /**
+     * The floor must survive a downstream di.xml that re-declares an item name, which Magento
+     * merges by replacing the value.
+     *
+     * @return void
+     */
+    public function testProtectedFloorSurvivesAnEmptyDiConfiguration(): void
+    {
+        $policy = $this->floorPolicy();
+
+        foreach (['admin_user', 'core_config_data', 'magebit_mcp_token', 'tfa_user_config'] as $name) {
+            self::assertNotNull(
+                $policy->findProtectedIdentifier($name),
+                sprintf('`%s` must be protected even with no di.xml arguments.', $name)
+            );
         }
     }
 
@@ -1446,9 +1508,8 @@ class QueryGuardTest extends TestCase
 
     public function testRejectsBaseTableUsedOutsideTheScopeOfASameNamedNestedCte(): void
     {
-        // Probed on MariaDB 10.6: a WITH inside a derived table is scoped to that derived table,
-        // so the outer reference reads the *base* table. A statement-wide CTE exemption would
-        // hand over any table an attacker names in a nested WITH.
+        // Probed on MariaDB 10.6: a `WITH` inside a derived table is scoped to it, so the outer
+        // reference reads the *base* table. A statement-wide CTE exemption would hand it over.
         $this->assertRejected(
             'SELECT d.a, s.id FROM (WITH unlisted_ledger AS (SELECT 1 AS a) SELECT a FROM unlisted_ledger) d, '
             . 'unlisted_ledger s',
@@ -1478,7 +1539,6 @@ class QueryGuardTest extends TestCase
 
     public function testAllowlistEntryDoesNotAdmitASuffixedTable(): void
     {
-        // The fail-open direction of the old word-run matcher.
         $guard = $this->guard(100, 1000, ['customer_entity']);
         $this->assertRejectedBy($guard, 'SELECT a FROM customer_entity_backup', 'customer_entity_backup');
     }
@@ -1488,7 +1548,7 @@ class QueryGuardTest extends TestCase
         $guard = $this->guard(100, 1000, ['user', 'order', 'entity']);
         $this->assertRejectedBy($guard, 'SELECT a FROM sales_order', 'sales_order');
         $this->assertRejectedBy($guard, 'SELECT a FROM customer_entity', 'customer_entity');
-        // The brief's own example: an allowed bare `user` must never admit `admin_user`.
+        // An allowed bare `user` must never admit `admin_user`.
         $this->assertRejectedBy($guard, 'SELECT a FROM admin_user', 'admin_user');
     }
 
@@ -1671,9 +1731,8 @@ class QueryGuardTest extends TestCase
     }
 
     /**
-     * The security review's cardholder-data exploit: with `sales_order_payment` allowlisted — a
-     * routine addition for order analytics — this returned last four, brand and full expiry in
-     * bulk, joinable to the cardholder's name and address on `sales_order`.
+     * Cardholder-data harvest: with `sales_order_payment` allowlisted — a routine addition for order
+     * analytics — this returned last four, brand and expiry in bulk, joinable to the cardholder.
      *
      * @return void
      */
@@ -1734,7 +1793,7 @@ class QueryGuardTest extends TestCase
         // TRIGGERS and EVENTS embed statement bodies; TABLE STATUS reports per-table row counts.
         $this->assertRejected('SHOW TRIGGERS', 'SHOW');
         $this->assertRejected('SHOW EVENTS', 'SHOW');
-        // `SHOW TABLE STATUS` is now intercepted one layer earlier, by the `TABLE` keyword denial.
+        // Intercepted by the `TABLE` keyword denial, one layer earlier.
         $this->assertRejected('SHOW TABLE STATUS', 'TABLE');
         $this->assertRejected('SHOW OPEN TABLES', 'SHOW');
         $this->assertRejected('SHOW FUNCTION STATUS', 'SHOW');
@@ -1745,13 +1804,11 @@ class QueryGuardTest extends TestCase
         $this->assertRejected('SHOW TABLES FROM information_schema', 'information_schema');
     }
 
-    // ------------------------------------------------ table-value constructors (security review)
+    // ------------------------------------------------ table-value constructors
 
     /**
-     * `TABLE t` (MySQL 8.0.19+) is `SELECT * FROM t` written without a `*` and without naming a
-     * single column, so it defeated the allowlist, the column deny-list and the wildcard rule at
-     * once: as a UNION branch the name never reached a table position, and layers 6 and 7 had no
-     * token to reject. Refused as a keyword, which closes every spelling of the form.
+     * `TABLE t` is `SELECT * FROM t` with no `*` and no column names, so as a UNION branch it
+     * bypassed the allowlist, the column deny-list and the wildcard rule at once.
      *
      * @return array<string, array{string}>
      */
@@ -1788,10 +1845,8 @@ class QueryGuardTest extends TestCase
     }
 
     /**
-     * `NEXT VALUE FOR seq` advances a sequence — a write, inside a guard whose whole contract is
-     * read-only. It tokenises to three undenied words with no `(`, so neither the keyword layer nor
-     * the function allowlist engaged, and `FOR` ends the table list so the sequence name was never
-     * checked either.
+     * `NEXT VALUE FOR seq` is a write. It tokenises to three undenied words with no `(`, and `FOR`
+     * ends the table list, so neither the keyword layer nor the allowlist engaged.
      *
      * @return void
      */
@@ -1828,10 +1883,8 @@ class QueryGuardTest extends TestCase
     }
 
     /**
-     * A built-in can never be schema-qualified, so `magento.count(1)` always resolves to a stored
-     * function — the one thing the function allowlist exists to stop. The allowlist only inspected
-     * the word touching the `(`, and the qualifier sat in a non-table position, so nothing checked
-     * either half.
+     * A built-in is never schema-qualified, so `magento.count(1)` is always a stored function. The
+     * allowlist saw only the word touching the `(`; the qualifier sat in a non-table position.
      *
      * @return void
      */
@@ -1842,7 +1895,7 @@ class QueryGuardTest extends TestCase
         $this->assertRejected('SELECT magento.`count`(1) FROM customer_entity', 'count');
     }
 
-    // ------------------------------------------------ CTE scoping (fix round 1)
+    // ------------------------------------------------ CTE scoping
 
     /**
      * A non-recursive CTE's own name resolves to the *base table* inside its body, so registering
@@ -1892,11 +1945,8 @@ class QueryGuardTest extends TestCase
     }
 
     /**
-     * Documents the deliberate boundary of the fix, so it is not "tidied up" later: inside a
-     * `WITH RECURSIVE` list the name stays visible in its own body, and that is safe only because
-     * the server refuses an unanchored recursive element. Probed on MariaDB 10.6 for both the first
-     * and a later element of the list — `ERROR 4005: No anchors for recursive WITH element` — so
-     * such a statement can never reach the base table, whatever the guard says.
+     * Deliberate boundary, not a gap: inside `WITH RECURSIVE` the name stays visible in its own body,
+     * which is safe only because the server answers `ERROR 4005` for an unanchored element (MariaDB 10.6).
      *
      * @return void
      */
@@ -1934,6 +1984,41 @@ class QueryGuardTest extends TestCase
     {
         $sql = 'SELECT store_id, COUNT(*) FROM sales_order GROUP BY store_id WITH ROLLUP';
         $this->assertSame($sql . ' LIMIT 100', $this->guard()->assertReadOnly($sql));
+    }
+
+    /**
+     * @return array<string, array{string}>
+     */
+    public static function strayCteListContinuationProvider(): array
+    {
+        return [
+            'parenthesised main query' => [
+                'WITH x AS (SELECT 1 AS a) (SELECT a FROM x), cms_block AS (SELECT 1 AS b) '
+                . '(SELECT block_id FROM cms_block)',
+            ],
+            'parenthesised then union' => [
+                'WITH x AS (SELECT 1 AS a) (SELECT a FROM x), cms_block AS (SELECT 1 AS b) '
+                . 'UNION SELECT block_id FROM cms_block',
+            ],
+            'order by then union' => [
+                'WITH x AS (SELECT 1 AS a) (SELECT a FROM x) ORDER BY a, cms_block AS (SELECT 1 AS b) '
+                . 'UNION SELECT block_id FROM cms_block',
+            ],
+        ];
+    }
+
+    /**
+     * A `)` closing the main query must end the WITH list. Leaving it armed let the next comma
+     * register an arbitrary name as a CTE, exempting it from the allowlist.
+     *
+     * @dataProvider strayCteListContinuationProvider
+     * @param string $sql
+     * @return void
+     */
+    public function testStrayCommaCannotRegisterACteOutsideAWithList(string $sql): void
+    {
+        $guard = $this->guard(100, 1000, ['cms_page', 't', 't2']);
+        $this->assertRejectedBy($guard, $sql, 'cms_block');
     }
 
     // ------------------------------------------------ FROM inside function arguments
@@ -1981,5 +2066,72 @@ class QueryGuardTest extends TestCase
         // Probed on MariaDB 10.6: `lateral` is non-reserved there, so it can name a stored
         // function and must not carry the structural exemption.
         $this->assertRejected('SELECT lateral(1)', 'not a permitted function');
+    }
+
+    // ------------------------------------------------ quoted-identifier reconstruction
+
+    /**
+     * Statement, then the protected name the veto must report.
+     *
+     * @return array<string, array{string, string}>
+     */
+    public static function backtickSmugglingProvider(): array
+    {
+        return [
+            'admin_user' => ['SELECT `username`` FROM ``admin_user`', 'admin_user'],
+            'core_config_data' => ['SELECT `value`` FROM ``core_config_data`', 'core_config_data'],
+            'information_schema' => [
+                'SELECT `x`` FROM ``information_schema`.`tables`',
+                'information_schema',
+            ],
+        ];
+    }
+
+    /**
+     * The reconstruction already renders these inert — the doubled backtick stays doubled, so the
+     * smuggled `FROM` never leaves its identifier. The protected veto refuses them anyway: it is
+     * the backstop for a construct a later layer misreads, so it reads glued segments as names.
+     *
+     * @dataProvider backtickSmugglingProvider
+     * @param string $sql
+     * @param string $protectedName
+     * @return void
+     */
+    public function testDoubledBacktickCannotSmuggleAProtectedTable(string $sql, string $protectedName): void
+    {
+        $this->assertRejectedBy(
+            $this->guard(100, 1000, ['sales_order']),
+            $sql,
+            sprintf('The table `%s` is protected', $protectedName)
+        );
+    }
+
+    public function testQuotedIdentifierWithADoubledBacktickRoundTrips(): void
+    {
+        $guard = $this->guard(100, 1000, ['sales_order']);
+
+        $this->assertSame(
+            'SELECT `we``ird` FROM sales_order LIMIT 100',
+            $guard->assertReadOnly('SELECT `we``ird` FROM sales_order')
+        );
+    }
+
+    public function testOrdinaryQuotedIdentifiersAreUnaffectedByTheReconstruction(): void
+    {
+        $guard = $this->guard(100, 1000, ['sales_order']);
+
+        $this->assertSame(
+            'SELECT `entity_id` FROM `sales_order` LIMIT 100',
+            $guard->assertReadOnly('SELECT `entity_id` FROM `sales_order`')
+        );
+    }
+
+    public function testUnquotedProtectedTableIsStillRefused(): void
+    {
+        $this->assertRejectedBy(
+            $this->guard(100, 1000, ['sales_order']),
+            'SELECT entity_id FROM admin_user',
+            'The table `admin_user` is protected'
+        );
     }
 }

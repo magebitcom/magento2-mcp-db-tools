@@ -9,20 +9,10 @@ declare(strict_types=1);
 namespace Magebit\McpDbTools\Model;
 
 /**
- * Bookkeeping for one parenthesis level of {@see QueryGuard::assertTablesAreAllowlisted()}.
- *
- * One instance per nesting level, pushed on `(` and popped on `)`. CTE names live on the scope
- * that defined them rather than on the statement, because a `WITH` inside a derived table is
- * scoped to that derived table: a statement-wide list would let a nested `WITH x AS (…)` exempt a
- * reference to the real table `x` sitting outside that derived table.
- *
- * Registration *timing* matters as much as scoping. Inside a **plain** `WITH`'s own body the name
- * still resolves to the base table on MariaDB/MySQL, so a plain CTE is only brought into scope once
- * its body closes ({@see deferCommonTableExpression()}) — otherwise a self-reference would inherit
- * the exemption and skip the allowlist. `WITH RECURSIVE` is the one form where the name must be
- * visible inside the body ({@see defineCommonTableExpression()}): there a self-reference *is* the
- * CTE and can never fall through to a base table, because the server refuses an unanchored
- * recursive element outright (`ERROR 4005`).
+ * One parenthesis-level scope of {@see \Magebit\McpDbTools\Model\Sql\TableReferenceScanner}. CTE
+ * names live on the defining scope — a nested `WITH x` must not exempt the real table `x` outside
+ * it — and a plain CTE enters scope only once its body closes; only `WITH RECURSIVE` is visible
+ * inside its own body.
  */
 class TableScanScope
 {
@@ -47,17 +37,17 @@ class TableScanScope
      * Whether the next identifier here is a CTE name. Armed by a `WITH` clause opener and by a
      * comma continuing its list — by nothing else, so no other construct can register a name.
      */
-    public bool $expectCteName = false;
+    private bool $expectCteName = false;
 
     /**
      * Whether this level's `WITH` list was written `WITH RECURSIVE`.
      */
-    public bool $recursiveCteList = false;
+    private bool $recursiveCteList = false;
 
     /**
      * Whether a comma here continues the `WITH` list with another definition.
      */
-    public bool $continuesCteList = false;
+    private bool $continuesCteList = false;
 
     /**
      * @param bool $expectTable Whether the next identifier here is a table reference.
@@ -66,10 +56,123 @@ class TableScanScope
      *        `FROM` and `IN` are argument separators (`EXTRACT(YEAR FROM col)`), not clauses.
      */
     public function __construct(
-        public bool $expectTable,
-        public bool $inTableList,
-        public bool $inFunctionArguments = false
+        private bool $expectTable,
+        private bool $inTableList,
+        private bool $inFunctionArguments = false
     ) {
+    }
+
+    /**
+     * @return bool
+     */
+    public function expectsTable(): bool
+    {
+        return $this->expectTable;
+    }
+
+    /**
+     * @return bool
+     */
+    public function isInFunctionArguments(): bool
+    {
+        return $this->inFunctionArguments;
+    }
+
+    /**
+     * @return void
+     */
+    public function expectTable(): void
+    {
+        $this->expectTable = true;
+    }
+
+    /**
+     * @return void
+     */
+    public function clearTableExpectation(): void
+    {
+        $this->expectTable = false;
+    }
+
+    /**
+     * A `FROM`/`JOIN` opened a table list: the next identifier is a table, and so is the one after
+     * each comma until the list is terminated.
+     *
+     * @return void
+     */
+    public function enterTableList(): void
+    {
+        $this->expectTable = true;
+        $this->inTableList = true;
+    }
+
+    /**
+     * @return void
+     */
+    public function leaveTableList(): void
+    {
+        $this->inTableList = false;
+    }
+
+    /**
+     * A comma continues whichever list is open here — a table list, a `WITH` list, or neither.
+     *
+     * @return void
+     */
+    public function sawComma(): void
+    {
+        $this->expectTable = $this->inTableList;
+
+        if ($this->continuesCteList) {
+            $this->expectCteName = true;
+            $this->continuesCteList = false;
+        }
+    }
+
+    /**
+     * `IN` names a table only in `SHOW … IN <table>`; elsewhere it introduces a value list, and
+     * inside function arguments it separates them (`POSITION('a' IN col)`).
+     *
+     * @param bool $isShowStatement
+     * @return void
+     */
+    public function expectShowTarget(bool $isShowStatement): void
+    {
+        $this->expectTable = $isShowStatement && !$this->inFunctionArguments;
+    }
+
+    /**
+     * @param bool $recursive
+     * @return void
+     */
+    public function beginCteList(bool $recursive): void
+    {
+        $this->expectCteName = true;
+        $this->recursiveCteList = $recursive;
+    }
+
+    /**
+     * @return bool
+     */
+    public function expectsCteName(): bool
+    {
+        return $this->expectCteName;
+    }
+
+    /**
+     * @return bool
+     */
+    public function isRecursiveCteList(): bool
+    {
+        return $this->recursiveCteList;
+    }
+
+    /**
+     * @return void
+     */
+    public function clearCteNameExpectation(): void
+    {
+        $this->expectCteName = false;
     }
 
     /**
@@ -106,6 +209,8 @@ class TableScanScope
     public function closeCommonTableExpressionBody(): void
     {
         if (!$this->insideCommonTableExpressionBody) {
+            // The main query block closed, so the WITH list is over: a later comma must not re-arm it.
+            $this->continuesCteList = false;
             return;
         }
 

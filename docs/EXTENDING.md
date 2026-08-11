@@ -10,6 +10,10 @@ If your project or a third-party module stores credentials, tokens, personal dat
 that must never be readable through `db.query`, add it to the protected set from your own module's
 `etc/di.xml`. Magento merges array arguments across modules, so no patch to this module is needed.
 
+These arguments are **additive only**. The set this module ships lives in class constants on
+`TableAccessPolicy` and is unioned with whatever DI supplies, so anything you declare here extends
+the protected set and nothing you declare here can shrink it.
+
 ```xml
 <?xml version="1.0"?>
 <config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
@@ -42,17 +46,18 @@ leak.
 A protected name wins over everything. It is refused wherever it appears in a statement, and listing
 it in **Allowed Tables** is reported as a configuration error rather than being silently ignored.
 
-### One thing not to do
+### You cannot soften the shipped set
 
-Items are keyed by name, so declaring an item with a key this module already ships **overrides** it.
-Do not use that to soften the shipped set — the whole point of declaring it in `di.xml` is that
-weakening it takes filesystem write access plus a recompile, which is a boundary worth keeping
-meaningful. If a shipped entry is genuinely wrong for everyone, open an issue upstream.
+Magento keys DI array items by name, so declaring an item with a key this module already ships
+would normally **override** it. That is exactly why the shipped set is not declared in `di.xml`: it
+is a class constant that is unioned in on every read path, so re-declaring a shipped name is a
+no-op rather than a way to unprotect a table. If a shipped entry is genuinely wrong for everyone,
+open an issue upstream.
 
 ## Removing access without touching code
 
 To block a table for this install only, use **Additional Denied Tables**
-(`magebit_mcp/db_tools/extra_denied_tables`) in the admin. Entries there are merged into the
+(`magebit_mcp_db_tools/general/extra_denied_tables`) in the admin. Entries there are merged into the
 wide-matched protected terms and can only ever *remove* access. It is rarely needed now that access
 is allowlist-only — its use is belt and braces for a name you want blocked even if someone later
 adds it to **Allowed Tables**.
@@ -73,11 +78,27 @@ adds it to **Allowed Tables**.
   Every layer there is pinned by tests that assert *which* layer refused a statement, so a change
   that swaps one verdict for another fails the suite rather than drifting.
 
+  Two parsing machines sit behind it as collaborators, and neither is a seam either:
+  `Model\Sql\Lexer` turns the statement into tokens and the normalised SQL rebuilt from them, and
+  `Model\Sql\TableReferenceScanner` reads which of those tokens sit in a table position. Both are
+  concrete classes constructor-injected into `QueryGuard`, so they are technically preferenceable —
+  but every refusal decision stays in `QueryGuard`. The scanner *reports* table names and applies
+  no policy; substituting it would silently change what the allowlist is applied to.
+
 ## Adding a different database tool
 
 `db.query` is registered into `Magebit\Mcp\Model\Tool\ToolRegistry` in this module's `etc/di.xml`
 like any other MCP tool. A new tool belongs in its own module, implementing
 `Magebit\Mcp\Api\ToolInterface` with its own ACL resource — see `docs/EXTENDING.md` in
-`Magebit_Mcp`. If it accepts operator-supplied SQL, compose `Magebit\McpDbTools\Model\QueryGuard`
-and execute the string it returns **verbatim**; the guarantee that what was validated is what runs
-is the property the whole design rests on.
+`Magebit_Mcp`. If it accepts operator-supplied SQL, three pieces are required, not one:
+
+1. Compose `Magebit\McpDbTools\Model\QueryGuard` and execute the string it returns **verbatim**. The
+   guarantee that what was validated is what runs is the property the whole design rests on — do not
+   re-quote, re-wrap or reformat it.
+2. Implement `Magebit\Mcp\Api\ContextualAclAwareInterface`, returning
+   `Magebit\McpDbTools\Model\TableAclMap::resolve()` over the tables the statement names. `QueryGuard`
+   enforces the table allowlist but carries no admin-ACL opinion, so a tool that stops at step 1
+   silently drops the family invariant that MCP cannot read what the admin UI would deny.
+3. Refuse, in `execute()`, every table `TableAclMap::unmapped()` reports. The contextual contract
+   treats an empty list as "no opinion" and skips the gate, so without this an unmapped table is
+   readable with no admin resource demanded at all.

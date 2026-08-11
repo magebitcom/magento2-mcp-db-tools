@@ -2,9 +2,13 @@
 <config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
         xsi:noNamespaceSchemaLocation="urn:magento:module:Magento_Config:etc/system_file.xsd">
     <system>
-        <!-- Extends the `magebit_mcp` section shipped by Magebit_Mcp (resource Magebit_Mcp::config). -->
-        <section id="magebit_mcp">
-            <group id="db_tools" translate="label comment" type="text" sortOrder="70"
+        <section id="magebit_mcp_db_tools" translate="label" type="text" sortOrder="515"
+                 showInDefault="1" showInWebsite="0" showInStore="0">
+            <class>separator-top</class>
+            <label>MCP Server - Database Reader</label>
+            <tab>magebit</tab>
+            <resource>Magebit_McpDbTools::config</resource>
+            <group id="general" translate="label comment" type="text" sortOrder="10"
                    showInDefault="1" showInWebsite="0" showInStore="0">
                 <label>MCP Database Reader</label>
                 <comment><![CDATA[<p>Settings for the optional <code>db.query</code> tool — read-only SQL
@@ -35,7 +39,7 @@
                 <field id="default_rows" translate="label comment" type="text" sortOrder="20"
                        showInDefault="1" showInWebsite="0" showInStore="0">
                     <label>Default Row Limit</label>
-                    <validate>validate-greater-than-zero validate-digits</validate>
+                    <validate>validate-digits validate-digits-range digits-range-1-100000</validate>
                     <depends><field id="enabled">1</field></depends>
                     <comment><![CDATA[Row cap applied when a query does not ask for one. Keeping this
                     small limits how much data a single careless or hostile call can extract, and how
@@ -44,7 +48,7 @@
                 <field id="row_limit_ceiling" translate="label comment" type="text" sortOrder="30"
                        showInDefault="1" showInWebsite="0" showInStore="0">
                     <label>Maximum Row Limit</label>
-                    <validate>validate-greater-than-zero validate-digits</validate>
+                    <validate>validate-digits validate-digits-range digits-range-1-100000</validate>
                     <depends><field id="enabled">1</field></depends>
                     <comment><![CDATA[Hard ceiling a caller can never exceed, however large a limit it
                     requests. This is the bulk-exfiltration brake — raising it directly raises how many
@@ -53,7 +57,7 @@
                 <field id="statement_timeout_seconds" translate="label comment" type="text" sortOrder="40"
                        showInDefault="1" showInWebsite="0" showInStore="0">
                     <label>Statement Timeout (seconds)</label>
-                    <validate>validate-greater-than-zero validate-digits</validate>
+                    <validate>validate-digits validate-digits-range digits-range-1-3600</validate>
                     <depends><field id="enabled">1</field></depends>
                     <comment><![CDATA[Server-side time budget per query. This is the denial-of-service
                     brake: without it a single unindexed join can pin a database thread and starve the
@@ -62,6 +66,7 @@
                 <field id="allowed_tables" translate="label comment" type="textarea" sortOrder="45"
                        showInDefault="1" showInWebsite="0" showInStore="0">
                     <label>Allowed Tables</label>
+                    <backend_model>Magebit\McpDbTools\Model\Config\Backend\AllowedTables</backend_model>
                     <depends><field id="enabled">1</field></depends>
                     <comment><![CDATA[<p><strong>The tool can read these tables and no others.</strong>
                     One bare table name per line — no schema prefix, no quoting, no wildcards. Blank
@@ -97,6 +102,7 @@ sales_order_status_history</pre>
                 <field id="extra_denied_tables" translate="label comment" type="textarea" sortOrder="50"
                        showInDefault="1" showInWebsite="0" showInStore="0">
                     <label>Additional Denied Tables</label>
+                    <backend_model>Magebit\McpDbTools\Model\Config\Backend\DeniedTables</backend_model>
                     <depends><field id="enabled">1</field></depends>
                     <comment><![CDATA[<p>One table name per line, protected on top of the allowlist.
                     Blank lines and lines starting with <code>#</code> are ignored.</p>
@@ -105,6 +111,27 @@ sales_order_status_history</pre>
                     Tables</em>, and it matches wrapper tables too (a denied <code>my_vault</code>
                     also blocks <code>my_vault_archive</code>). Entries here only ever <em>remove</em>
                     access; they can never grant it.]]></comment>
+                </field>
+                <field id="table_acl_map" translate="label comment" type="textarea" sortOrder="55"
+                       showInDefault="1" showInWebsite="0" showInStore="0">
+                    <label>Table Permission Map</label>
+                    <depends><field id="enabled">1</field></depends>
+                    <comment><![CDATA[<p><strong>Which admin permission each allowed table takes to
+                    read.</strong> One <code>table:Vendor_Module::resource</code> per line — the table
+                    name without the install's prefix, then the admin ACL resource the caller's role
+                    must hold. Blank lines and lines starting with <code>#</code> are ignored.</p>
+                    <p>This is what keeps raw SQL from reading what the domain tools would refuse: a
+                    role that may not open orders in the admin cannot read <code>sales_order</code>
+                    here either. Example:</p>
+                    <pre>sales_order:Magento_Sales::sales_order
+sales_order_item:Magento_Sales::sales_order
+customer_entity:Magento_Customer::manage
+cms_page:Magento_Cms::page
+catalog_product_entity:Magento_Catalog::products</pre>
+                    <p><strong>Every table in <em>Allowed Tables</em> needs a line.</strong> A query
+                    naming a table with no line is <em>refused</em> — the tool will not run a read it
+                    cannot attach a permission to. A malformed line, or one whose resource is not a
+                    <code>Vendor_Module::resource</code> id, is ignored and therefore refuses too.</p>]]></comment>
                 </field>
             </group>
         </section>
