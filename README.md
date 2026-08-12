@@ -503,3 +503,11 @@ statement timeout could be applied.
 
 The protected set is designed to be extended by other modules — see
 [`docs/EXTENDING.md`](docs/EXTENDING.md).
+
+---
+
+![Magebit](https://github.com/user-attachments/assets/cdc904ce-e839-40a0-a86f-792f7ab7961f)
+
+Magebit - Full-service e-commerce agency
+
+[magebit.com](https://magebit.com)
